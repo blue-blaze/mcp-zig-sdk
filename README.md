@@ -185,18 +185,23 @@ Two findings worth recording, both about the other end:
 
 ## Platforms
 
-Linux, macOS, and Windows all build — library, tests, examples, and the interop checker —
-and all three run the suite in CI.
+Linux, macOS, and Windows are all built and tested in CI: the unit tests, the format
+check, and the example builds run on all three. The jobs that need a shell and a network
+namespace — running the example programs end to end, schema conformance, fuzzing, and the
+interoperability matrix — are Linux-only.
 
-Windows support is **compile-verified but not run-verified by the author**: it was broken
-until this was checked, in two places. `src/mcp/velo_http.zig`'s shutdown watchdog slept
-with `std.posix.poll`, which does not exist there; it now owns a private `std.Io.Threaded`,
-which is portable and keeps the property the separate thread exists for — not sharing the
-server's scheduler, since being unscheduled while idle is what it is there to notice. And
-three programs iterated argv with `Args.iterate`, a compile error on Windows, where argv
-must be decoded into a buffer the iterator owns.
+Windows was broken until this was checked, in three places, and each one is the kind that
+only shows up on the platform itself:
 
-If the Windows job is red, believe it over this paragraph.
+- `src/mcp/velo_http.zig`'s shutdown watchdog slept with `std.posix.poll`, which does not
+  exist there. It now owns a private `std.Io.Threaded`, which is portable and keeps the
+  property the separate thread exists for — not sharing the server's scheduler, since
+  being unscheduled while idle is what it is there to notice.
+- Three programs iterated argv with `Args.iterate`, a compile error on Windows, where
+  argv must be decoded into a buffer the iterator owns.
+- `zig fmt --check` rejected every `.zig` file, because Windows runners ship
+  `core.autocrlf=true` and there was no `.gitattributes`. That one reads like a formatting
+  problem in the code and is not one; see the comment in `.gitattributes`.
 
 ## Testing
 
