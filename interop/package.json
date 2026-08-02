@@ -1,0 +1,14 @@
+{
+  "name": "zig-mcp-sdk-interop",
+  "private": true,
+  "type": "module",
+  "description": "Interoperability harness: the official TypeScript SDK on the other end of the wire.",
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
+    "@modelcontextprotocol/node": "2.0.0",
+    "@modelcontextprotocol/server": "2.0.0"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/inspector": "^2.0.0"
+  }
+}

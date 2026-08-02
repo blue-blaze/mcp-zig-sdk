@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "zig-stdio": {
+      "type": "stdio",
+      "command": "./zig-out/bin/stdio-server",
+      "args": [],
+      "protocolEra": "modern"
+    },
+    "zig-http": {
+      "type": "http",
+      "url": "http://127.0.0.1:8787/mcp",
+      "protocolEra": "modern"
+    }
+  }
+}

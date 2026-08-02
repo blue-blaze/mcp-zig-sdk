@@ -1,0 +1,37 @@
+.{
+    // A Zig SDK for the Model Context Protocol, revision 2026-07-28 ("MCP 2.0").
+    .name = .mcp,
+    .version = "0.1.0-dev",
+    .fingerprint = 0xa19bc839996a86d4,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Velo supplies the HTTP/1.1+HTTP/2 server and client that the Streamable
+        // HTTP transport is built on. The `mcp` module depends on it; the `oauth`
+        // module takes it only for outbound metadata/token fetches, and never for
+        // anything MCP-specific.
+        // A release tag, not a branch: a branch moves by design, so its contents would
+        // change underneath the recorded hash. A tag is meant to be immutable, and if one
+        // is ever moved the hash check fails loudly rather than building something else.
+        // Update both fields together:
+        //   zig fetch --save=velo git+https://github.com/blue-blaze/velo.git#<tag>
+        .velo = .{
+            .url = "git+https://github.com/blue-blaze/velo.git#v0.1.1",
+            .hash = "velo-0.1.1-LF_4KkfiFQDY6HFzbJ4bl8pubtIWKpSzm_0HhFDjbe4N",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        // Referenced by `build.zig` (the `spec` and `interop` steps), so a fetched copy
+        // without it could not run this project's own build.
+        "tools",
+        "spec",
+        "README.md",
+        // Apache-2.0 requires the NOTICE to travel with redistributions, so it belongs in
+        // the package rather than only in the repository.
+        "LICENSE",
+        "NOTICE",
+    },
+}

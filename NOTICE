@@ -1,0 +1,21 @@
+mcp-zig-sdk
+Copyright 2026 blue-blaze
+
+This product includes software developed by blue-blaze.
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file.
+
+--------------------------------------------------------------------------------
+Third-party material
+--------------------------------------------------------------------------------
+
+spec/schema.json
+
+    The official JSON Schema for the Model Context Protocol, revision 2026-07-28,
+    included verbatim so that `zig build spec` is reproducible and works offline.
+
+    Copyright the Model Context Protocol contributors.
+    Source: https://github.com/modelcontextprotocol/modelcontextprotocol
+    Licensed under the Apache License, Version 2.0.
+
+    See spec/README.md for the retrieval details.

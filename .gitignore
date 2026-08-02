@@ -1,0 +1,18 @@
+.zig-cache/
+zig-out/
+.DS_Store
+.venv-spec/
+
+# Interoperability harness: the official TypeScript SDK is installed on demand,
+# not vendored. `interop/package.json` pins the versions.
+interop/node_modules/
+interop/package-lock.json
+
+# Developer TLS artifacts for the https round-trip test. Generated, never shared:
+#   openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
+#     -days 365 -nodes -subj "/CN=localhost"
+# The test skips when they are absent, so a fresh clone stays green.
+*.pem
+
+# Zig's local dependency cache.
+zig-pkg/

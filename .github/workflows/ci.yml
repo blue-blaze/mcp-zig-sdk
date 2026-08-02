@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Weekly, because two of the things this checks can break without anyone touching this
+  # repository: the pinned Zig release interacting with new dependency commits, and the
+  # interoperability harness against a newly published TypeScript SDK.
+  schedule:
+    - cron: "0 6 * * 1"
+
+# A new push supersedes an in-flight run on the same ref. Not applied to `main`, where
+# every commit's result is worth keeping.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  # The suite runs on every platform this could plausibly be used on, because the
+  # transports touch pipes, sockets, and process spawning — the three areas where
+  # "works on my machine" is most often the whole story.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Don't let the first platform to fail hide the others: knowing whether a failure is
+      # platform-specific is most of the diagnosis.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Unit tests
+        run: zig build test
+
+      - name: Formatting
+        run: zig build fmt
+
+      - name: Examples build
+        run: zig build examples
+
+  # Separate from `test` because it needs Python, and because a schema-conformance failure
+  # is a different kind of news from a failing unit test.
+  spec:
+    name: spec conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate every emitted payload against spec/schema.json
+        run: zig build spec
+
+  # Short by design: enough iterations to catch a regression on a pull request, not a
+  # campaign. The seed is fixed so a failure here reproduces locally with the exact
+  # command the log shows.
+  fuzz:
+    name: fuzz (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Fuzz the peer-facing parsers
+        run: zig build fuzz -- 50000 0
+
+  # The end-to-end examples talk over real sockets and real pipes, which is the only place
+  # the shutdown paths and the subscription streams are exercised at all.
+  examples:
+    name: examples run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build
+        run: zig build examples
+
+      - name: smoke
+        run: ./zig-out/bin/smoke
+
+      - name: OAuth flow against a real socket
+        run: ./zig-out/bin/oauth-flow
+
+      - name: Authorization end to end over HTTP
+        run: ./zig-out/bin/http-auth
+
+      - name: stdio client against the stdio server
+        run: ./zig-out/bin/stdio-client ./zig-out/bin/stdio-server
+
+      - name: HTTP client against the HTTP server
+        run: |
+          ./zig-out/bin/http-server > /tmp/server.log 2>&1 &
+          server_pid=$!
+          sleep 1
+          ./zig-out/bin/http-client
+          kill -INT "$server_pid"
+          wait "$server_pid" || true
+          # The example server runs under a leak-checking allocator, so its own report is
+          # part of the result rather than something to read by eye.
+          if grep -q leaked /tmp/server.log; then
+            echo "the server reported a leak"
+            cat /tmp/server.log
+            exit 1
+          fi
+
+  # Against two independent implementations. Kept separate because it needs Node, and
+  # because a failure here is about the other end of the wire as often as about this one.
+  interop:
+    name: interoperability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install the harness
+        working-directory: interop
+        # Not vendored; `interop/package.json` pins the versions.
+        run: npm install --no-audit --no-fund
+
+      - name: Official TypeScript SDK, all four legs
+        run: ./interop/run.sh
+
+      - name: MCP Inspector, both transports
+        run: ./interop/inspector.sh
