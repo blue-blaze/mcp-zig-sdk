@@ -121,6 +121,25 @@ Every wire payload this SDK emits is validated against `spec/schema.json` by
 `zig build spec` — 103 samples across 79 schema definitions, produced by running
 the real server, client, and subscription broker rather than written by hand.
 
+## Subscriptions and the response-write bound
+
+A `subscriptions/listen` stream is one HTTP response that never ends, and that collides
+with a defence Velo applies by default: `timeouts.write_ms` bounds how long writing one
+response may take, so that a peer which stops reading cannot pin a connection. The bound
+is armed once around the whole response, so its 30-second default was a hard cap on how
+long any subscription could live. `mcp.velo_http.listen` now lifts it for a server that
+serves subscriptions, and `WriteBound` documents what that gives up and how to keep it.
+
+Keep-alives do not help, which is the part that misleads: they are writes that *succeed*,
+and the bound is on elapsed write time rather than on idleness. Nothing in this repository
+could have noticed — the unit tests, all four interoperability legs, and the Inspector run
+finish well inside 30 seconds. It took holding a subscription open and waiting, and it was
+reported from use rather than found by the suite.
+
+A server built with `mount` on its own Velo app has to set `write_ms = 0` itself; the
+doc comment on `mount` says so, because the failure is a stream that works perfectly for
+thirty seconds and then closes with no reply.
+
 ## Handler state
 
 Comptime-registered handlers take only a `*Context`, so application state arrives on the

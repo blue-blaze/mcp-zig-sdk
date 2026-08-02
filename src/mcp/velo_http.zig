@@ -58,6 +58,12 @@ pub const App = velo.App(*State);
 /// to Velo's own 404 — which is *not* what the spec asks for, so both are registered
 /// explicitly to answer 405 instead. The distinction matters to an older client: 405
 /// says "this endpoint exists but that verb is gone", where 404 says "wrong URL".
+///
+/// A server that mounts this and serves subscriptions must also set
+/// `timeouts.write_ms = 0`, which is what `listen` does for you and what `WriteBound`
+/// explains. Velo's default caps one response write at 30 seconds, and a subscription
+/// stream is one response, so leaving it in place ends every subscription after 30
+/// seconds — visible to the client as a stream that closes with no reply.
 pub fn mount(app: *App, path: []const u8) !void {
     try app.post(path, handlePost);
     try app.get(path, handleRemoved);
@@ -112,7 +118,72 @@ fn handleRemoved(ctx: *velo.Context) !void {
 pub const ListenOptions = struct {
     host: []const u8 = "127.0.0.1",
     server: velo.http.server.Options = .{},
+    write_bound: WriteBound = .lift_for_subscriptions,
 };
+
+/// What to do about Velo's bound on how long writing one response may take.
+///
+/// Velo bounds a response write (`Timeouts.write_ms`, 30 seconds by default) so that a
+/// peer which stops reading cannot pin a connection — the mirror image of a slow
+/// request, and the same denial of service. That bound is armed once around the whole
+/// response, which is right for a response that ends. A `subscriptions/listen` stream
+/// is one response that does *not* end, so the bound is a hard cap on how long any
+/// subscription can live: every stream was cut exactly `write_ms` after it opened.
+///
+/// Keep-alives do not help, and the reason is worth stating because it is the part that
+/// misleads. They are writes that succeed, and the bound is on the elapsed write phase
+/// rather than on idleness — so the mechanism that exists to keep a stream healthy
+/// cannot extend one. Nothing in the SDK could observe this either: the keep-alive
+/// interval, every test, and all four interoperability legs finish well inside 30
+/// seconds. It took holding a subscription open and waiting.
+pub const WriteBound = enum {
+    /// Remove the bound when this server serves subscriptions. The default, because a
+    /// finite write bound and a working subscription are mutually exclusive.
+    ///
+    /// What that gives up is real and worth stating: on this server a peer that stops
+    /// reading holds its connection until someone closes it, bounded then only by
+    /// `connections_max`. A deployment unwilling to accept that should serve
+    /// subscriptions from a listener of their own, where lifting the bound reaches
+    /// nothing else.
+    lift_for_subscriptions,
+    /// Leave `server.timeouts` exactly as given, and accept that a subscription lives
+    /// no longer than `write_ms`.
+    keep,
+};
+
+/// The response-write bound a server with these options should run with.
+///
+/// Separate from `listen` so that it is testable without a process: the interesting
+/// case is a *combination* of options, and the cost of getting it wrong is a stream
+/// that works for thirty seconds.
+pub fn writeBoundMs(policy: WriteBound, subscriptions_served: bool, requested: u32) u32 {
+    return switch (policy) {
+        .keep => requested,
+        .lift_for_subscriptions => if (subscriptions_served) 0 else requested,
+    };
+}
+
+/// The Velo options `listen` will run with, given this state and these options.
+///
+/// Assembled here rather than inline so that what `listen` ends up configuring can be
+/// asserted without binding a port. The bug this exists to prevent was not a wrong
+/// policy but a policy that was never applied.
+fn serverOptionsFor(
+    state: *const State,
+    options: ListenOptions,
+    stop: *velo.ShutdownFlag,
+) velo.http.server.Options {
+    var server_options = options.server;
+    server_options.serve.stop = stop;
+    // A subscription stream cannot live under a bound on the response write; see
+    // `WriteBound`.
+    server_options.timeouts.write_ms = writeBoundMs(
+        options.write_bound,
+        state.broker != null,
+        server_options.timeouts.write_ms,
+    );
+    return server_options;
+}
 
 /// Serves the app until interrupted, then shuts down without hanging.
 ///
@@ -137,8 +208,7 @@ pub fn listen(
     var stop: velo.ShutdownFlag = .init(false);
     velo.lifecycle.installSignalHandlers(&stop);
 
-    var server_options = options.server;
-    server_options.serve.stop = &stop;
+    const server_options = serverOptionsFor(state, options, &stop);
 
     var address = try velo.net.Address.parse(options.host, port);
     var srv = try velo.http.Server(*App).init(io, &address, App.adapter, app, server_options);
@@ -472,4 +542,53 @@ test "the endpoint state carries the server and its options" {
     );
     try testing.expectEqual(@as(usize, 1), state.endpoint.options.allowed_origins.len);
     try testing.expect(state.endpoint.server == &server);
+}
+
+test "the write bound is lifted for a server that serves subscriptions" {
+    // 30_000 stands in for Velo's default here; what matters is that a requested bound
+    // is discarded when subscriptions are served and kept when they are not.
+    try testing.expectEqual(@as(u32, 0), writeBoundMs(.lift_for_subscriptions, true, 30_000));
+    try testing.expectEqual(@as(u32, 30_000), writeBoundMs(.lift_for_subscriptions, false, 30_000));
+
+    // `.keep` is the caller saying they would rather have the bound than the stream.
+    try testing.expectEqual(@as(u32, 30_000), writeBoundMs(.keep, true, 30_000));
+    try testing.expectEqual(@as(u32, 30_000), writeBoundMs(.keep, false, 30_000));
+
+    // Nothing to lift.
+    try testing.expectEqual(@as(u32, 0), writeBoundMs(.lift_for_subscriptions, true, 0));
+    try testing.expectEqual(@as(u32, 0), writeBoundMs(.keep, true, 0));
+}
+
+test "listen applies the write bound policy rather than merely defining it" {
+    var registry: server_mod.Registry = .init(testing.allocator);
+    defer registry.deinit();
+    const server: Server = .init(&registry, .{ .name = "s", .version = "1" }, .{});
+
+    var broker: subscriptions.Broker = .init(testing.allocator, .{ .name = "s", .version = "1" });
+    defer broker.closeAll();
+
+    var stop: velo.ShutdownFlag = .init(false);
+
+    // Velo's own default is what a caller who passes `.{}` gets, and it is finite. This
+    // is the case that was broken: every subscription ended after `write_ms`.
+    const velo_default = (velo.http.server.Options{}).timeouts.write_ms;
+    try testing.expect(velo_default > 0);
+
+    var serving: State = .init(testing.allocator, &server, .{});
+    serving.broker = &broker;
+    const serving_options = serverOptionsFor(&serving, .{}, &stop);
+    try testing.expectEqual(@as(u32, 0), serving_options.timeouts.write_ms);
+
+    // A server with no broker answers `subscriptions/listen` as unimplemented, so it has
+    // no long-lived response and no reason to give up the bound.
+    var plain: State = .init(testing.allocator, &server, .{});
+    const plain_options = serverOptionsFor(&plain, .{}, &stop);
+    try testing.expectEqual(velo_default, plain_options.timeouts.write_ms);
+
+    // `.keep` reaches Velo untouched even when subscriptions are served.
+    const kept = serverOptionsFor(&serving, .{ .write_bound = .keep }, &stop);
+    try testing.expectEqual(velo_default, kept.timeouts.write_ms);
+
+    // The stop flag is wired either way; it is what makes Ctrl-C work.
+    try testing.expect(serving_options.serve.stop == &stop);
 }
