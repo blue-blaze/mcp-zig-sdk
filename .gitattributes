@@ -1,0 +1,21 @@
+# Line endings are LF in the working tree on every platform.
+#
+# This is load-bearing, not tidiness. Windows GitHub runners ship
+# `core.autocrlf=true`, so without this file a Windows checkout converts every text file
+# to CRLF — and `zig fmt --check` rejects CRLF outright. The result was a `fmt` step that
+# reported *every* `.zig` file as "non-conforming formatting" on Windows while passing on
+# Linux and macOS, which reads like a formatting problem in the code and is not one.
+#
+# The same conversion breaks the shell scripts (`bash` reads the `\r` as part of the
+# command) and would silently alter `spec/schema.json`, which is vendored byte-for-byte
+# from the specification repository and documented as unmodified.
+* text=auto eol=lf
+
+# Stated explicitly for the files where CRLF is not a cosmetic difference but a failure.
+*.zig   text eol=lf
+*.zon   text eol=lf
+*.sh    text eol=lf
+*.py    text eol=lf
+*.mjs   text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
