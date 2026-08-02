@@ -20,6 +20,9 @@ permissions:
   contents: read
 
 env:
+  # `setup-zig@v2`, not `v1`: v1 resolves a release version against
+  # `ziglang.org/builds`, which only holds nightlies, so every mirror and the official
+  # fallback answered 404 for 0.16.0 and all five jobs died before running anything.
   ZIG_VERSION: 0.16.0
 
 jobs:
@@ -38,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: mlugg/setup-zig@v1
+      - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
 
@@ -59,7 +62,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: mlugg/setup-zig@v1
+      - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
 
@@ -79,7 +82,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: mlugg/setup-zig@v1
+      - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
 
@@ -94,7 +97,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: mlugg/setup-zig@v1
+      - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
 
@@ -119,7 +122,10 @@ jobs:
           server_pid=$!
           sleep 1
           ./zig-out/bin/http-client
-          kill -INT "$server_pid"
+          # Both tolerated: the server may already have exited, and `wait` reports the
+          # signal that stopped it. `run:` steps execute under `bash -e`, so an untolerated
+          # non-zero here would fail a step that actually succeeded.
+          kill -INT "$server_pid" || true
           wait "$server_pid" || true
           # The example server runs under a leak-checking allocator, so its own report is
           # part of the result rather than something to read by eye.
@@ -137,7 +143,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: mlugg/setup-zig@v1
+      - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
 

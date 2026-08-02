@@ -16,6 +16,12 @@ set -uo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
+# Built here rather than assumed: this script was only ever run after `run.sh`, which
+# builds as a side effect, so the dependency was real but invisible. Running it alone —
+# which is the whole point of it being a separate script — would have used a stale binary
+# or none at all.
+zig build examples || exit 1
+
 inspector="./interop/node_modules/.bin/mcp-inspector"
 if [ ! -x "$inspector" ]; then
     echo "inspector: not installed — run 'npm install' in interop/" >&2
