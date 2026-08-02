@@ -155,7 +155,7 @@ pub fn main() !void {
     // application that owns the broker. One shared constant breaks the cycle without
     // either of them holding a half-built version of the other.
     const info: mcp.types.Implementation = .{
-        .name = "zig-mcp-sdk-http-example",
+        .name = "mcp-zig-sdk-http-example",
         .version = "0.1.0",
     };
 

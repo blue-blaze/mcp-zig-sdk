@@ -162,7 +162,7 @@ fn completeReview(
 const readme_body =
     \\# Example server
     \\
-    \\A stdio MCP server built with zig-mcp-sdk. It exposes three tools, one
+    \\A stdio MCP server built with mcp-zig-sdk. It exposes three tools, one
     \\prompt, and this file.
 ;
 
@@ -277,8 +277,8 @@ pub fn main() !void {
     defer registry.deinit();
 
     const server: mcp.Server = .init(&registry, .{
-        .name = "zig-mcp-sdk-example",
-        .title = "zig-mcp-sdk example server",
+        .name = "mcp-zig-sdk-example",
+        .title = "mcp-zig-sdk example server",
         .version = "0.1.0",
     }, .{
         .instructions =

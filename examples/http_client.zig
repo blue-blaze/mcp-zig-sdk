@@ -73,7 +73,7 @@ pub fn main(init: std.process.Init) !void {
 
     var mcp_client: mcp.Client = .init(
         transport.transport(),
-        .{ .name = "zig-mcp-sdk-http-client", .version = "0.1.0" },
+        .{ .name = "mcp-zig-sdk-http-client", .version = "0.1.0" },
         .{ .observer = printer.observer() },
     );
 

@@ -246,7 +246,7 @@ const McpThread = struct {
         defer registry.deinit();
 
         const server: mcp.Server = .init(&registry, .{
-            .name = "zig-mcp-sdk-protected-example",
+            .name = "mcp-zig-sdk-protected-example",
             .version = "0.1.0",
         }, .{});
 

@@ -112,7 +112,7 @@ fn runHttp(gpa: std.mem.Allocator, io: std.Io, url: []const u8) !void {
     defer transport.deinit();
 
     var client: mcp.Client = .init(transport.transport(), .{
-        .name = "zig-mcp-sdk-interop",
+        .name = "mcp-zig-sdk-interop",
         .version = "0.1.0",
     }, .{ .observer = recorder.observer() });
 
@@ -133,7 +133,7 @@ fn runStdio(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void 
 
     const transport = child.transport();
     var client: mcp.Client = .init(transport, .{
-        .name = "zig-mcp-sdk-interop",
+        .name = "mcp-zig-sdk-interop",
         .version = "0.1.0",
     }, .{ .observer = recorder.observer() });
 

@@ -93,8 +93,8 @@ fn emitServerReplies(gpa: std.mem.Allocator, out: *std.Io.Writer) !void {
     defer reg.deinit();
 
     const server: mcp.Server = .init(&reg, .{
-        .name = "zig-mcp-sdk-sample",
-        .version = "0.1.0-dev",
+        .name = "mcp-zig-sdk-sample",
+        .version = "0.1.0",
     }, .{
         .instructions = "Call get_forecast for weather.",
         .cache = .{
@@ -280,7 +280,7 @@ fn emitClientRequests(gpa: std.mem.Allocator, out: *std.Io.Writer) !void {
 
     var mcp_client: mcp.Client = .init(
         recorder.transport(),
-        .{ .name = "zig-mcp-sdk-sample", .version = "0.1.0-dev" },
+        .{ .name = "mcp-zig-sdk-sample", .version = "0.1.0" },
         .{},
     );
 
@@ -391,8 +391,8 @@ fn emitSubscriptions(gpa: std.mem.Allocator, out: *std.Io.Writer) !void {
     defer collector.deinit();
 
     var broker: mcp.subscriptions.Broker = .init(gpa, .{
-        .name = "zig-mcp-sdk-sample",
-        .version = "0.1.0-dev",
+        .name = "mcp-zig-sdk-sample",
+        .version = "0.1.0",
     });
 
     const subscriber = try broker.subscribe(.{
@@ -466,8 +466,8 @@ fn emitInputRequired(gpa: std.mem.Allocator, out: *std.Io.Writer) !void {
     defer reg.deinit();
 
     const server: mcp.Server = .init(&reg, .{
-        .name = "zig-mcp-sdk-sample",
-        .version = "0.1.0-dev",
+        .name = "mcp-zig-sdk-sample",
+        .version = "0.1.0",
     }, .{});
 
     const meta = "\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"," ++
@@ -571,8 +571,8 @@ fn emitTransportErrors(gpa: std.mem.Allocator, out: *std.Io.Writer) !void {
     defer reg.deinit();
 
     const server: mcp.Server = .init(&reg, .{
-        .name = "zig-mcp-sdk-sample",
-        .version = "0.1.0-dev",
+        .name = "mcp-zig-sdk-sample",
+        .version = "0.1.0",
     }, .{});
     const endpoint: mcp.http.Endpoint = .{
         .server = &server,
@@ -705,10 +705,10 @@ fn emitSamples(arena: std.mem.Allocator, out: *std.Io.Writer) !void {
 
     // ---- Metadata --------------------------------------------------------
     try emit(out, "Implementation", types.Implementation{
-        .name = "zig-mcp-sdk",
-        .version = "0.1.0-dev",
+        .name = "mcp-zig-sdk",
+        .version = "0.1.0",
         .title = "Zig MCP SDK",
-        .websiteUrl = "https://example.invalid/zig-mcp-sdk",
+        .websiteUrl = "https://example.invalid/mcp-zig-sdk",
         .icons = &.{.{ .src = "https://example.invalid/i.png", .mimeType = "image/png", .theme = .light }},
     });
     try emit(out, "Icon", types.Icon{ .src = "https://example.invalid/i.png", .sizes = &.{"48x48"} });

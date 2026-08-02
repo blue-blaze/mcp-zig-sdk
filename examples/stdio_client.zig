@@ -157,7 +157,7 @@ pub fn main(init: std.process.Init) !void {
     try elicitation_modes.put(gpa, "url", .{ .object = .empty });
 
     var client: mcp.Client = .init(server.transport(), .{
-        .name = "zig-mcp-sdk-example-client",
+        .name = "mcp-zig-sdk-example-client",
         .version = "0.1.0",
     }, .{
         .capabilities = .{ .elicitation = .{ .object = elicitation_modes } },
