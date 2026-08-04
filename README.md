@@ -140,7 +140,58 @@ A server built with `mount` on its own Velo app has to set `write_ms = 0` itself
 doc comment on `mount` says so, because the failure is a stream that works perfectly for
 thirty seconds and then closes with no reply.
 
-## Handler state
+## Memory
+
+Request memory is an arena the transport owns. A handler allocates from
+`context.arena` and never frees: the arena is released once the reply has been written,
+so there are no `defer free`s in handler code and no way for a handler to outlive its own
+allocations. Long-lived state — the registry, the subscription broker, the transport
+itself — takes a general allocator from the application and is torn down by it.
+
+Everything with a per-peer cost is a fixed-size table rather than a growing container, so
+a peer cannot enlarge the server: 4096 registry entries, 256 subscribers, 64 subscribed
+URIs each, 64 queued notifications each (identical ones coalesce), 1024 cancellable
+in-flight requests. Exceeding one is a refusal, not an allocation.
+
+Which allocator backs `context.arena` depends on the transport, and the difference is
+large enough to matter when choosing what a tool returns:
+
+| | Backing | Behaviour |
+|---|---|---|
+| Streamable HTTP, `stream_responses = true` (default) | fresh arena over the application's allocator | grows on the heap, freed when the request ends |
+| Streamable HTTP, `stream_responses = false` | Velo's per-request scratch arena | **fixed 128 KiB**; exceeding it fails the request |
+| stdio | one arena reused per message, `retain_capacity` | grows to the high-water mark and **keeps** it |
+
+Three consequences worth knowing before they are discovered:
+
+- On the default HTTP path nothing bounds a reply, so a tool whose output scales with its
+  arguments lets the caller choose how much the server allocates. Clamp such arguments in
+  the handler; `@min(args.limit, ceiling)` is the whole fix.
+- A stdio server's memory settles at the largest message it has ever handled, because the
+  arena retains capacity between messages. That is not a leak, and it is why one oversized
+  response raises resident memory for the life of the process.
+- Notifications are encoded into the request arena and are not freed until the request
+  ends, so a handler that reports progress per row accumulates every one of those messages.
+  Report per batch.
+
+Request bodies over HTTP are bounded by what Velo can buffer rather than by the protocol's
+16 MiB ceiling, and the effective limit is lower still — the body and its parsed form share
+one 128 KiB arena, so roughly 50 KB of arguments is the practical ceiling. Past it the
+reply is a JSON-RPC error rather than a bare status. Larger inputs belong in a resource
+the tool reads, not in its arguments.
+
+### Returning a lot of data
+
+The protocol has no chunked tool result: a result is one object, and progress
+notifications cannot carry pieces of it. So a tool that could return a million rows has to
+be designed not to, and the SDK's pagination (`page_size`, cursors) covers `tools/list`
+and its siblings — not tool output. For a database server that means, in order of
+preference: page in the tool's own arguments and clamp the page size; return a
+`resource_link` and let the client read what it wants; report progress per batch rather
+than per row; and check `context.checkCancelled()` at batch boundaries, since on HTTP a
+client that closes the stream has already stopped caring about the rest.
+
+### Handler state
 
 Comptime-registered handlers take only a `*Context`, so application state arrives on the
 context rather than through a global:

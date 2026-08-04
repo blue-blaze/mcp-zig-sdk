@@ -52,6 +52,75 @@ pub const State = struct {
 
 pub const App = velo.App(*State);
 
+/// The largest request body this transport accepts.
+///
+/// Deliberately *not* `http.body_size_max`. That is the protocol's own ceiling, 16 MiB,
+/// and it is right for stdio, where the request arena grows on the heap. Here the body is
+/// read into Velo's per-request scratch arena — a fixed buffer — so what this transport
+/// can honour is bounded by Velo, and claiming otherwise only moves the failure later.
+///
+/// Passing the protocol ceiling was worse than merely optimistic. `readBody` sizes its
+/// buffer from the declared `Content-Length` when there is one and from *this bound* when
+/// there is not, so the number is an allocation request as well as a limit: a request
+/// with no declared length asked a 128 KiB fixed arena for 16 MiB and could not
+/// possibly succeed.
+pub const body_size_max: usize = velo.limits.request_body_bytes_max;
+
+comptime {
+    // The body is read into the scratch arena, so a bound at or above the arena's size
+    // would not be a bound at all. If Velo ever raises one without the other, this
+    // fails here rather than as an out-of-memory reply under load.
+    assert_mod.comptime_assert(body_size_max < velo.limits.request_scratch_bytes);
+}
+
+/// Replies that must not allocate, because the reason they are being sent is that
+/// allocation failed or cannot be trusted.
+///
+/// Velo's response *borrows* its body rather than copying it, so a constant is enough.
+/// Each is a complete JSON-RPC error object: a client reading a bare status with an empty
+/// body learns nothing it can act on, and this transport's whole contract is that the
+/// error is in the body.
+const static_reply = struct {
+    /// `id` is null because it is genuinely unknown: naming the request's id would mean
+    /// parsing the body with the allocator that just refused.
+    const out_of_memory =
+        \\{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"the server ran out of memory handling this request"}}
+    ;
+    /// `parse_error`, matching what `http.Endpoint` answers an oversized body with, so
+    /// the two paths do not describe the same condition differently.
+    const body_too_large =
+        \\{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"request body too large for this transport"}}
+    ;
+    const body_unreadable =
+        \\{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"request body could not be read"}}
+    ;
+    /// Named rather than reported as a parse error, which is what an absent body would
+    /// otherwise produce. Telling a client with valid JSON that its JSON is broken sends
+    /// it looking in the wrong place.
+    const chunked_unsupported =
+        \\{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"chunked request bodies are not supported by this transport; send Content-Length"}}
+    ;
+};
+
+/// Answers with a body that needs no allocation.
+///
+/// The Content-Type is set before the status because `text` only supplies its own when
+/// none is present, and these bodies are JSON rather than the `text/plain` it assumes.
+fn respondStatic(ctx: *velo.Context, status: velo.http.Status, body: []const u8) !void {
+    try ctx.setHeader("Content-Type", "application/json");
+    try ctx.text(status, body);
+}
+
+/// Whether the request declared a body that Velo did not deliver.
+///
+/// Velo wires a body reader for `Content-Length` framing only, so a chunked request
+/// reaches a handler with its body silently absent — indistinguishable, from the body
+/// alone, from a request that legitimately sent nothing.
+fn bodyWasDropped(ctx: *velo.Context) bool {
+    const encoding = ctx.header("transfer-encoding") orelse return false;
+    return encoding.len > 0;
+}
+
 /// Registers the MCP endpoint on `path`.
 ///
 /// Only POST is routed. A GET or DELETE reaching the same path therefore falls through
@@ -288,10 +357,18 @@ fn watchShutdown(
 fn handlePost(ctx: *velo.Context) !void {
     const state = ctx.stateAs(*State).*;
 
-    const body = ctx.readBody(http.body_size_max) catch {
-        try ctx.text(.bad_request, "");
-        return;
-    };
+    const body = ctx.readBody(body_size_max) catch |err| return respondStatic(
+        ctx,
+        .bad_request,
+        switch (err) {
+            error.PayloadTooLarge => static_reply.body_too_large,
+            else => static_reply.body_unreadable,
+        },
+    );
+
+    if (body.len == 0 and bodyWasDropped(ctx)) {
+        return respondStatic(ctx, .bad_request, static_reply.chunked_unsupported);
+    }
 
     // Velo writes the response *after* the handler returns, and runs a stream body
     // later still. So nothing produced here may live on this function's stack or in an
@@ -301,14 +378,23 @@ fn handlePost(ctx: *velo.Context) !void {
     const arena = ctx.arena;
 
     var headers: VeloHeaders = .{ .ctx = ctx };
-    const outcome = try state.endpoint.handle(arena, .{
+    const outcome = state.endpoint.handle(arena, .{
         .method = "POST",
         .body = body,
         .headers = headers.headers(),
         // Read once, here, so that every expiry check within this request agrees.
         // `.real` rather than `.awake`: a token's `exp` is a wall-clock instant.
         .received_at = std.Io.Clock.real.now(ctx.io).toSeconds(),
-    });
+    }) catch |err| switch (err) {
+        // Reached when the reply did not fit the scratch arena. Velo turns an error
+        // returned from here into a bare 500 with no body, which tells a client only
+        // that something went wrong and never what.
+        error.OutOfMemory => return respondStatic(
+            ctx,
+            .internal_server_error,
+            static_reply.out_of_memory,
+        ),
+    };
 
     switch (outcome) {
         .empty => |status| {
@@ -333,8 +419,16 @@ fn handlePost(ctx: *velo.Context) !void {
             // The parsed message borrows from `arena`, which is fine — but it is
             // re-parsed inside the stream anyway, because that keeps the parsed form's
             // lifetime tied to the handler that reads it rather than to this decision.
-            const pending = try arena.create(Pending);
-            pending.* = .{ .state = state, .body = try arena.dupe(u8, body) };
+            const pending = arena.create(Pending) catch return respondStatic(
+                ctx,
+                .internal_server_error,
+                static_reply.out_of_memory,
+            );
+            // `readBody` allocated the body in `ctx.arena`, and that arena outlives the
+            // streamed response, so the bytes are already owned for exactly long enough.
+            // They used to be duplicated here, which put two copies of every request in
+            // a fixed 128 KiB arena and roughly halved the largest request that worked.
+            pending.* = .{ .state = state, .body = body };
 
             try ctx.setHeader("Cache-Control", "no-cache");
             // Without this, nginx and friends buffer the whole body and a stream of
@@ -591,4 +685,51 @@ test "listen applies the write bound policy rather than merely defining it" {
 
     // The stop flag is wired either way; it is what makes Ctrl-C work.
     try testing.expect(serving_options.serve.stop == &stop);
+}
+
+test "every static reply is a JSON-RPC error a client can act on" {
+    // These exist because the paths that send them cannot allocate, which also means
+    // nothing formats or validates them at runtime. A typo would ship a malformed body
+    // on exactly the paths that are hardest to reach — worse than the empty body this
+    // replaced, since a client would then fail to parse rather than fail to learn.
+    const cases = [_]struct { body: []const u8, code: i64 }{
+        .{ .body = static_reply.out_of_memory, .code = jsonrpc.error_code.internal_error },
+        .{ .body = static_reply.body_too_large, .code = jsonrpc.error_code.parse_error },
+        .{ .body = static_reply.body_unreadable, .code = jsonrpc.error_code.parse_error },
+        .{ .body = static_reply.chunked_unsupported, .code = jsonrpc.error_code.invalid_request },
+    };
+
+    for (cases) |case| {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+
+        const parsed = try std.json.parseFromSliceLeaky(
+            std.json.Value,
+            arena.allocator(),
+            case.body,
+            .{},
+        );
+        const object = parsed.object;
+        try testing.expectEqualStrings("2.0", object.get("jsonrpc").?.string);
+        // Null rather than absent: a client matching on `id` should see the field and
+        // find it unknown, not have to guess whether the server omitted it.
+        try testing.expect(object.get("id").? == .null);
+
+        const err = object.get("error").?.object;
+        try testing.expectEqual(case.code, err.get("code").?.integer);
+        try testing.expect(err.get("message").?.string.len > 0);
+    }
+}
+
+test "the transport's body bound is Velo's, not the protocol's" {
+    // The protocol ceiling is right for stdio and unreachable here, and the gap is
+    // large enough that using the wrong one looks like it works until a request has no
+    // `Content-Length` — at which point the bound becomes the size of the allocation
+    // that must fail.
+    try testing.expect(body_size_max < http.body_size_max);
+    try testing.expectEqual(velo.limits.request_body_bytes_max, body_size_max);
+
+    // Restated as a runtime check so the relationship appears in the test output, not
+    // only as a compile error nobody sees once it holds.
+    try testing.expect(body_size_max < velo.limits.request_scratch_bytes);
 }
