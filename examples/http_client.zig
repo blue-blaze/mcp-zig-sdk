@@ -194,7 +194,7 @@ fn subscribe(
     const call = try mcp_client.exchange(
         arena,
         mcp.types.method.subscriptions_listen,
-        .{ .object = params },
+        .{ .value = .{ .object = params } },
         .{},
     );
     if (call.failure) |failure| {

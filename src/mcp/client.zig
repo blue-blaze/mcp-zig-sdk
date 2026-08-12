@@ -19,6 +19,24 @@
 //! decoded result all live in it, so a decoded `ListToolsResult` borrows from the
 //! arena and stays valid exactly as long as it does. Nothing needs freeing
 //! individually.
+//!
+//! ## Three layers, and when to drop down
+//!
+//! `listTools`, `callTool` and the rest are the top layer: one method each, decoded
+//! into the type in `types.zig`. They are where to start, and they cover the protocol
+//! as of this revision.
+//!
+//! Below them, `request` sends any method and decodes into any type — for a method a
+//! server added that this SDK has no wrapper for, or one from a later revision.
+//!
+//! Below that, `exchange` sends the request and hands back `Call`: the raw bytes, the
+//! `result` value, the `error` object, uninterpreted. Use it when a result does not fit
+//! the types here, when `resultType` needs inspecting directly, or when a decode
+//! failure needs diagnosing — a `UnexpectedResult` from either layer above means
+//! `exchange` will still give you the payload that produced it.
+//!
+//! Params can be pre-encoded text at any of the three layers: see `Params.raw`,
+//! `callToolJson`, and `Options.diagnostics` for what a refusal will tell you.
 
 const std = @import("std");
 const assert_mod = @import("assert");
@@ -33,6 +51,24 @@ const assert = assert_mod.assert;
 /// which fits both transports without either compromising: on stdio `receive` reads
 /// the next line of a long-lived duplex stream, and on Streamable HTTP it yields the
 /// events of one response body. The client does not care which.
+///
+/// ## No `Io` parameter, deliberately
+///
+/// An implementation that performs I/O captures an `Io` when it is constructed and
+/// stores it. That is the intended pattern, not an oversight: a transport is built for
+/// one connection and lives as long as it, so the `Io` it needs is settled before the
+/// first message and threading it through every call would say otherwise. Both
+/// transports in this SDK do exactly this.
+///
+/// ## Abandoning a call is safe
+///
+/// A caller that stops waiting — a deadline, a cancelled task — does not corrupt the
+/// client. Request ids are monotonic and never reused, and `receive` skips any response
+/// whose id is not the one being awaited, so a late reply to an abandoned request is
+/// discarded rather than mistaken for the next one. This is a guarantee, not an
+/// accident of the implementation, and a caller building its own deadline may rely on
+/// it. `Client.cancel` tells the server it may stop working, which is courtesy rather
+/// than a requirement.
 pub const Transport = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -48,13 +84,24 @@ pub const Transport = struct {
     /// use OAuth, because the client started the process and can hand it credentials
     /// directly.
     pub const SendError = error{ TransportFailed, MessageTooLarge, Unauthorized, OutOfMemory };
-    pub const ReceiveError = error{ TransportFailed, MessageTooLarge, OutOfMemory };
+
+    /// `Timeout` is how a transport says "the peer has gone quiet" as opposed to "the
+    /// peer is gone". A transport with no deadline never returns it, and a caller that
+    /// sees it knows the connection may still be good — which is what makes retrying,
+    /// rather than reconnecting, the right next move.
+    pub const ReceiveError = error{ TransportFailed, MessageTooLarge, Timeout, OutOfMemory };
 
     pub const VTable = struct {
         /// Delivers one complete, framed message.
         send: *const fn (ptr: *anyopaque, message: []const u8) SendError!void,
         /// Reads the next inbound message, allocated in `arena`, or null when the
         /// peer has nothing more to say.
+        ///
+        /// Blocks until there is something to return. An implementation that can bound
+        /// that wait should, and should report expiry as `Timeout`: this is the only
+        /// place a hung server can be noticed, and a client with no bound here waits
+        /// forever on one. Returning `Timeout` does not invalidate the connection, and
+        /// abandoning the call it belonged to is safe — see this type's documentation.
         receive: *const fn (
             ptr: *anyopaque,
             arena: std.mem.Allocator,
@@ -101,6 +148,9 @@ pub const Observer = struct {
 /// spec requires of a client at this point is the application's responsibility —
 /// showing which server is asking, displaying a URL in full before opening it, and
 /// offering a real way to decline.
+///
+/// Takes no `Io`, for the same reason `Transport` does not: an implementation that
+/// needs one captures it at construction, which is where the answer is already known.
 pub const Elicitor = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -145,37 +195,65 @@ pub const InputRequired = struct {
     pub fn fromResult(result: std.json.Value) Error!InputRequired {
         const object = switch (result) {
             .object => |object| object,
-            else => return error.Malformed,
+            else => return error.UnexpectedResult,
         };
 
         const requests = if (object.get("inputRequests")) |value| switch (value) {
             .object => |map| map,
-            else => return error.Malformed,
+            else => return error.UnexpectedResult,
         } else null;
 
         const state = if (object.get("requestState")) |value| switch (value) {
             .string => |string| string,
-            else => return error.Malformed,
+            else => return error.UnexpectedResult,
         } else null;
 
         // The spec requires at least one. Neither would leave the client retrying an
         // unchanged request forever.
-        if (requests == null and state == null) return error.Malformed;
+        if (requests == null and state == null) return error.UnexpectedResult;
         return .{ .requests = requests, .state = state };
     }
 };
 
+/// Why a call did not produce a result.
+///
+/// These are deliberately specific about *who* is at fault, because that is the first
+/// thing a caller needs and the hardest thing to recover from an error value alone.
+/// `InvalidParams` is this client's caller; `InvalidReply`, `UnexpectedResult` and
+/// `UnsupportedResultType` are the peer; the rest is the connection between them.
+///
+/// Set `Options.diagnostics` to get the specifics — which field, which method, what
+/// the bytes actually said. An error value names the category; the writer says what
+/// happened.
 pub const Error = error{
     /// The transport could not deliver or read a message.
     TransportFailed,
     /// A message exceeded the protocol limit.
     MessageTooLarge,
-    /// The peer's reply was not a well-formed JSON-RPC response.
-    Malformed,
+    /// The transport gave up waiting for the peer. Only a transport that has a
+    /// deadline produces this; see `Transport.receive`.
+    Timeout,
+    /// The peer's message was not a well-formed JSON-RPC reply — not JSON at all, or
+    /// JSON that is not a response, or an error response with no error object.
+    InvalidReply,
+    /// The reply was a well-formed JSON-RPC response whose `result` is not shaped like
+    /// the type asked for.
+    ///
+    /// Most often a peer on a different protocol revision. `exchange` returns the raw
+    /// result without decoding it, so a caller who knows what the peer meant can read
+    /// it anyway.
+    UnexpectedResult,
     /// The reply carries a `resultType` this SDK does not know, so the payload cannot
     /// be read. Only a server on a later revision produces one; `exchange` still
     /// returns the raw result for a caller willing to interpret it.
     UnsupportedResultType,
+    /// The params handed to this client cannot be sent. MCP params are objects: a JSON
+    /// array has nowhere to put `_meta`, and raw params text that is not an object
+    /// cannot be spliced into one.
+    ///
+    /// Kept apart from the two above because it is the calling code's bug, not the
+    /// peer's, and the two lead somewhere completely different.
+    InvalidParams,
     /// The peer closed the exchange without answering.
     NoResponse,
     /// The server answered with a JSON-RPC error. Inspect `Call.failure` for it.
@@ -256,6 +334,51 @@ pub const Options = struct {
     /// A server streaming progress is normal; a server streaming forever is not, and
     /// without a bound a client would wait for it indefinitely.
     messages_max: usize = 4096,
+    /// Where this client explains itself when it refuses something.
+    ///
+    /// Every error returned from here is one of a dozen names, and a name cannot say
+    /// which field would not decode or what the peer actually sent. Point this at
+    /// `std.Io.Writer` — stderr, a log, a buffer a test reads back — and each refusal
+    /// writes one line naming the method, the cause, and the bytes it was looking at.
+    ///
+    /// Off by default because the bytes may carry whatever the peer put in them, and a
+    /// library should not decide that belongs in a log.
+    diagnostics: ?*std.Io.Writer = null,
+};
+
+/// The `params` member of a request.
+///
+/// A union rather than `?std.json.Value` so that pre-encoded text is a first-class
+/// case. See `raw`.
+pub const Params = union(enum) {
+    /// The method takes no arguments of its own. `_meta` is still sent.
+    none,
+    /// A parsed value, merged key by key with `_meta`.
+    value: std.json.Value,
+    /// A JSON object, already encoded, written through byte for byte.
+    ///
+    /// For arguments that came from a model. Parsing and re-encoding is not
+    /// shape-preserving — number formatting, key order and duplicate keys can all
+    /// change — and a tool argument that differs between what the model decided and
+    /// what the server ran is a bug nobody sees, because both halves look right on
+    /// their own.
+    ///
+    /// The text must be a JSON object. That much is checked, since it has to be
+    /// spliced into one alongside `_meta`; nothing inside is validated, because
+    /// validating it would mean the parse this case exists to avoid. Invalid JSON in
+    /// here reaches the server as invalid JSON, and the server rejects it — that is
+    /// the trade, and it is the caller's to make.
+    raw: []const u8,
+
+    /// The interior of a raw object: everything between the braces, trimmed.
+    ///
+    /// Empty for `{}`, which merges as "nothing to add".
+    fn interior(text: []const u8) error{InvalidParams}![]const u8 {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len < 2) return error.InvalidParams;
+        if (trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}') return error.InvalidParams;
+        return std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+    }
 };
 
 pub const Client = struct {
@@ -285,7 +408,7 @@ pub const Client = struct {
         arena: std.mem.Allocator,
         options: CallOptions,
     ) Error!types.DiscoverResult {
-        return client.request(types.DiscoverResult, arena, types.method.discover, null, options);
+        return client.request(types.DiscoverResult, arena, types.method.discover, .none, options);
     }
 
     pub const ListOptions = struct {
@@ -352,9 +475,77 @@ pub const Client = struct {
             types.CallToolResult,
             arena,
             types.method.tools_call,
-            .{ .object = params },
+            .{ .value = .{ .object = params } },
             options,
         );
+    }
+
+    /// Invokes a tool with arguments that are already JSON text.
+    ///
+    /// The same call as `callTool`, for a caller who has the arguments encoded already —
+    /// from `std.json.Stringify` over its own struct, from a config file, or forwarded
+    /// from somewhere else. Parsing that text only to re-encode it costs a pass over the
+    /// bytes and, worse, does not round-trip: key order changes, and numbers a
+    /// `std.json.Value` cannot hold exactly come back different.
+    ///
+    /// `arguments_json` must be one complete JSON value. It is spliced in unvalidated,
+    /// so text that is not JSON produces a request the server will reject — see
+    /// `Params.raw`. Empty or blank text sends no arguments at all.
+    pub fn callToolJson(
+        client: *Client,
+        arena: std.mem.Allocator,
+        name: []const u8,
+        arguments_json: []const u8,
+        options: CallOptions,
+    ) Error!types.CallToolResult {
+        return client.request(
+            types.CallToolResult,
+            arena,
+            types.method.tools_call,
+            try toolParamsJson(arena, name, arguments_json),
+            options,
+        );
+    }
+
+    /// `callToolJson`, handling any input the server asks for along the way.
+    pub fn callToolInteractiveJson(
+        client: *Client,
+        arena: std.mem.Allocator,
+        name: []const u8,
+        arguments_json: []const u8,
+        options: CallOptions,
+    ) Error!types.CallToolResult {
+        return client.requestInteractive(
+            types.CallToolResult,
+            arena,
+            types.method.tools_call,
+            try toolParamsJson(arena, name, arguments_json),
+            options,
+        );
+    }
+
+    /// Builds `tools/call` params around pre-encoded arguments.
+    fn toolParamsJson(
+        arena: std.mem.Allocator,
+        name: []const u8,
+        arguments_json: []const u8,
+    ) error{OutOfMemory}!Params {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        const writer = &out.writer;
+
+        writer.writeAll("{") catch return error.OutOfMemory;
+        var members: Members = .{ .writer = writer };
+        try members.field("name", name);
+        // Blank text is read as "no arguments" rather than passed through, which would
+        // put a member with no value on the wire.
+        try members.raw(blk: {
+            const trimmed = std.mem.trim(u8, arguments_json, " \t\r\n");
+            if (trimmed.len == 0) break :blk "";
+            break :blk try std.fmt.allocPrint(arena, "\"arguments\":{s}", .{trimmed});
+        });
+        writer.writeAll("}") catch return error.OutOfMemory;
+
+        return .{ .raw = out.written() };
     }
 
     pub fn getPrompt(
@@ -372,7 +563,7 @@ pub const Client = struct {
             types.GetPromptResult,
             arena,
             types.method.prompts_get,
-            .{ .object = params },
+            .{ .value = .{ .object = params } },
             options,
         );
     }
@@ -390,7 +581,7 @@ pub const Client = struct {
             types.ReadResourceResult,
             arena,
             types.method.resources_read,
-            .{ .object = params },
+            .{ .value = .{ .object = params } },
             options,
         );
     }
@@ -428,7 +619,7 @@ pub const Client = struct {
             types.CompleteResult,
             arena,
             types.method.completion_complete,
-            .{ .object = params },
+            .{ .value = .{ .object = params } },
             options,
         );
     }
@@ -482,29 +673,33 @@ pub const Client = struct {
         var params: std.json.ObjectMap = .empty;
         if (options.cursor) |cursor| try params.put(arena, "cursor", .{ .string = cursor });
 
-        return client.request(T, arena, method, .{ .object = params }, options.call);
+        return client.request(T, arena, method, .{ .value = .{ .object = params } }, options.call);
     }
 
     /// Sends a request and decodes the result.
+    ///
+    /// For a method with no typed wrapper, or a result this client's types do not
+    /// describe, use `exchange`: it performs the same exchange and hands back the raw
+    /// result without interpreting it.
     pub fn request(
         client: *Client,
         comptime T: type,
         arena: std.mem.Allocator,
         method: []const u8,
-        params: ?std.json.Value,
+        params: Params,
         options: CallOptions,
     ) Error!T {
         const call = try client.exchange(arena, method, params, options);
-        const result = call.result orelse return failureError(call.failure);
+        const result = call.result orelse return client.failureError(method, call.failure);
 
         // The result type has to be checked before the payload is trusted: an
         // `input_required` result shares none of the fields a complete one has, and
         // silently decoding it as complete would drop the server's request for input.
-        switch (try mapDecode(types.resultTypeOf(result))) {
+        switch (try client.readResultType(method, call.bytes, result)) {
             .complete => {},
             .input_required => return error.InputRequired,
         }
-        return mapDecode(types.decode(T, arena, result));
+        return client.decodeResult(T, arena, method, call.bytes, result);
     }
 
     /// Sends a request, answering any input the server asks for, until it completes.
@@ -523,7 +718,7 @@ pub const Client = struct {
         comptime T: type,
         arena: std.mem.Allocator,
         method: []const u8,
-        params: ?std.json.Value,
+        params: Params,
         options: CallOptions,
     ) Error!T {
         var round: usize = 0;
@@ -538,54 +733,105 @@ pub const Client = struct {
                 params;
 
             const call = try client.exchange(arena, method, attempt, options);
-            const result = call.result orelse return failureError(call.failure);
+            const result = call.result orelse return client.failureError(method, call.failure);
 
-            switch (try mapDecode(types.resultTypeOf(result))) {
-                .complete => return mapDecode(types.decode(T, arena, result)),
+            switch (try client.readResultType(method, call.bytes, result)) {
+                .complete => return client.decodeResult(T, arena, method, call.bytes, result),
                 .input_required => {
-                    if (!types.method.supportsInputRequired(method)) return error.Malformed;
+                    if (!types.method.supportsInputRequired(method)) {
+                        client.report(
+                            "mcp: {s} answered input_required, which only tools/call, " ++
+                                "prompts/get and resources/read may do\n",
+                            .{method},
+                        );
+                        return error.UnexpectedResult;
+                    }
                     pending = try InputRequired.fromResult(result);
                 },
             }
         }
         // Out of rounds. The server is entitled to keep asking, so this is not
         // necessarily its fault — but a caller must not be left in the loop.
+        client.report(
+            "mcp: {s} still asking for input after {d} rounds; giving up\n",
+            .{ method, client.options.rounds_max },
+        );
         return error.InputRequired;
     }
 
     /// Builds the params for a retry: the original ones, plus the answers and state.
+    ///
+    /// Raw params are spliced rather than merged. Parsing them to merge would be exactly
+    /// the round trip `Params.raw` exists to avoid, so the answers are appended as text
+    /// beside whatever the caller wrote. Nothing needs stripping in either branch:
+    /// `withInput` always receives the caller's original params, never a previous
+    /// round's, so `inputResponses` and `requestState` cannot already be there — unless
+    /// the caller put them there, and then the duplicate is a fair thing to see.
     fn withInput(
         client: *Client,
         arena: std.mem.Allocator,
-        params: ?std.json.Value,
+        params: Params,
         required: InputRequired,
-    ) Error!std.json.Value {
-        var merged: std.json.ObjectMap = .empty;
-
-        if (params) |value| switch (value) {
-            .object => |object| {
-                var iterator = object.iterator();
-                while (iterator.next()) |entry| {
-                    // Anything left over from a previous round is replaced below.
-                    if (std.mem.eql(u8, entry.key_ptr.*, "inputResponses")) continue;
-                    if (std.mem.eql(u8, entry.key_ptr.*, "requestState")) continue;
-                    try merged.put(arena, entry.key_ptr.*, entry.value_ptr.*);
-                }
-            },
-            else => return error.Malformed,
-        };
-
+    ) Error!Params {
+        var added: std.json.ObjectMap = .empty;
         if (required.requests) |requests| {
             const responses = try client.answer(arena, requests);
-            try merged.put(arena, "inputResponses", .{ .object = responses });
+            try added.put(arena, "inputResponses", .{ .object = responses });
         }
         if (required.state) |state| {
             // Echoed byte for byte. Any change is tampering as far as the server is
             // concerned, and it is required to reject it.
-            try merged.put(arena, "requestState", .{ .string = state });
+            try added.put(arena, "requestState", .{ .string = state });
         }
 
-        return .{ .object = merged };
+        switch (params) {
+            .none => return .{ .value = .{ .object = added } },
+            .value => |value| {
+                const object = switch (value) {
+                    .object => |object| object,
+                    else => {
+                        client.report(
+                            "mcp: params must be a JSON object to answer input_required, " ++
+                                "not a {s}\n",
+                            .{@tagName(value)},
+                        );
+                        return error.InvalidParams;
+                    },
+                };
+
+                var merged: std.json.ObjectMap = .empty;
+                var iterator = object.iterator();
+                while (iterator.next()) |entry| {
+                    try merged.put(arena, entry.key_ptr.*, entry.value_ptr.*);
+                }
+                var extra = added.iterator();
+                while (extra.next()) |entry| {
+                    try merged.put(arena, entry.key_ptr.*, entry.value_ptr.*);
+                }
+                return .{ .value = .{ .object = merged } };
+            },
+            .raw => |text| {
+                const inner = Params.interior(text) catch {
+                    client.report(
+                        "mcp: raw params must be a JSON object; got {s}\n",
+                        .{preview(text)},
+                    );
+                    return error.InvalidParams;
+                };
+
+                var out: std.Io.Writer.Allocating = .init(arena);
+                const writer = &out.writer;
+                writer.writeAll("{") catch return error.OutOfMemory;
+                var members: Members = .{ .writer = writer };
+                try members.raw(inner);
+                var extra = added.iterator();
+                while (extra.next()) |entry| {
+                    try members.field(entry.key_ptr.*, entry.value_ptr.*);
+                }
+                writer.writeAll("}") catch return error.OutOfMemory;
+                return .{ .raw = out.written() };
+            },
+        }
     }
 
     /// Answers every request the server made.
@@ -611,7 +857,13 @@ pub const Client = struct {
                     // Sampling or roots: permitted by the schema, not implemented
                     // here, and answering with a guess would be worse than silence.
                     error.Unsupported => continue,
-                    error.Malformed => return error.Malformed,
+                    error.Malformed => {
+                        client.report(
+                            "mcp: input request {s} is not a shape this client can read\n",
+                            .{key},
+                        );
+                        return error.UnexpectedResult;
+                    },
                 }
             };
 
@@ -647,7 +899,7 @@ pub const Client = struct {
             types.CallToolResult,
             arena,
             types.method.tools_call,
-            .{ .object = params },
+            .{ .value = .{ .object = params } },
             options,
         );
     }
@@ -668,7 +920,7 @@ pub const Client = struct {
             types.GetPromptResult,
             arena,
             types.method.prompts_get,
-            .{ .object = params },
+            .{ .value = .{ .object = params } },
             options,
         );
     }
@@ -687,7 +939,7 @@ pub const Client = struct {
             types.ReadResourceResult,
             arena,
             types.method.resources_read,
-            .{ .object = params },
+            .{ .value = .{ .object = params } },
             options,
         );
     }
@@ -700,7 +952,7 @@ pub const Client = struct {
         client: *Client,
         arena: std.mem.Allocator,
         method: []const u8,
-        params: ?std.json.Value,
+        params: Params,
         options: CallOptions,
     ) Error!Call {
         const id = client.takeId();
@@ -722,7 +974,7 @@ pub const Client = struct {
         arena: std.mem.Allocator,
         id: jsonrpc.Id,
         method: []const u8,
-        params: ?std.json.Value,
+        params: Params,
         options: CallOptions,
     ) Error![]const u8 {
         const meta: types.RequestMeta = .{
@@ -744,29 +996,132 @@ pub const Client = struct {
 
         // `_meta` lives inside `params`, so params is always present even for methods
         // that take no arguments of their own.
-        writer.writeAll(",\"params\":{\"_meta\":") catch return error.OutOfMemory;
-        types.stringify(writer, meta) catch return error.OutOfMemory;
+        writer.writeAll(",\"params\":{") catch return error.OutOfMemory;
+        var members: Members = .{ .writer = writer };
+        try members.field("_meta", meta);
 
-        if (params) |value| switch (value) {
-            .object => |object| {
-                var iterator = object.iterator();
-                while (iterator.next()) |entry| {
-                    // `_meta` is the client's to set; a caller-supplied one would
-                    // produce a duplicate key.
-                    if (std.mem.eql(u8, entry.key_ptr.*, "_meta")) continue;
-                    writer.writeAll(",") catch return error.OutOfMemory;
-                    types.stringify(writer, entry.key_ptr.*) catch return error.OutOfMemory;
-                    writer.writeAll(":") catch return error.OutOfMemory;
-                    types.stringify(writer, entry.value_ptr.*) catch return error.OutOfMemory;
-                }
+        switch (params) {
+            .none => {},
+            .value => |value| switch (value) {
+                .object => |object| {
+                    var iterator = object.iterator();
+                    while (iterator.next()) |entry| {
+                        // `_meta` is the client's to set; a caller-supplied one would
+                        // produce a duplicate key.
+                        if (std.mem.eql(u8, entry.key_ptr.*, "_meta")) continue;
+                        try members.field(entry.key_ptr.*, entry.value_ptr.*);
+                    }
+                },
+                // JSON-RPC allows array params; MCP does not use them, and merging one
+                // with `_meta` is not possible.
+                else => {
+                    client.report(
+                        "mcp: {s} params must be a JSON object, not a {s}\n",
+                        .{ method, @tagName(value) },
+                    );
+                    return error.InvalidParams;
+                },
             },
-            // JSON-RPC allows array params; MCP does not use them, and merging one
-            // with `_meta` is not possible.
-            else => return error.Malformed,
-        };
+            .raw => |text| {
+                const inner = Params.interior(text) catch {
+                    client.report(
+                        "mcp: {s} raw params must be a JSON object; got {s}\n",
+                        .{ method, preview(text) },
+                    );
+                    return error.InvalidParams;
+                };
+                try members.raw(inner);
+            },
+        }
 
         writer.writeAll("}}") catch return error.OutOfMemory;
         return out.written();
+    }
+
+    // ---- Diagnostics and error mapping -----------------------------------
+
+    /// Writes one diagnostic line, if the caller asked for them.
+    ///
+    /// Best-effort: a diagnostics writer that fails must not turn into a failed
+    /// request, since the request itself was fine.
+    fn report(client: *const Client, comptime fmt: []const u8, args: anytype) void {
+        const writer = client.options.diagnostics orelse return;
+        writer.print(fmt, args) catch {};
+    }
+
+    /// Maps a JSON-RPC error onto a client error, singling out the one a caller can act
+    /// on automatically.
+    fn failureError(
+        client: *const Client,
+        method: []const u8,
+        failure: ?jsonrpc.ErrorObject,
+    ) Error {
+        const object = failure orelse {
+            client.report("mcp: {s} got an error response with no error object\n", .{method});
+            return error.InvalidReply;
+        };
+        if (object.code == jsonrpc.error_code.unsupported_protocol_version) {
+            client.report(
+                "mcp: {s} refused: the server does not speak {s}\n",
+                .{ method, types.protocol_version },
+            );
+            return error.UnsupportedProtocolVersion;
+        }
+        client.report(
+            "mcp: {s} failed: [{d}] {s}\n",
+            .{ method, object.code, object.message },
+        );
+        return error.RequestFailed;
+    }
+
+    /// Reads the result type, which decides whether the payload can be read at all.
+    fn readResultType(
+        client: *const Client,
+        method: []const u8,
+        bytes: []const u8,
+        result: std.json.Value,
+    ) Error!types.ResultType {
+        return types.resultTypeOf(result) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Malformed => {
+                client.report(
+                    "mcp: {s} result is not an object, so it is not an MCP result: {s}\n",
+                    .{ method, preview(bytes) },
+                );
+                return error.UnexpectedResult;
+            },
+            error.UnsupportedResultType => {
+                client.report(
+                    "mcp: {s} result carries a resultType from a later revision than " ++
+                        "{s}; use exchange to read it yourself: {s}\n",
+                    .{ method, types.protocol_version, preview(bytes) },
+                );
+                return error.UnsupportedResultType;
+            },
+        };
+    }
+
+    /// Decodes a result into the type a typed wrapper promised.
+    fn decodeResult(
+        client: *const Client,
+        comptime T: type,
+        arena: std.mem.Allocator,
+        method: []const u8,
+        bytes: []const u8,
+        result: std.json.Value,
+    ) Error!T {
+        return types.decode(T, arena, result) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.UnsupportedResultType => error.UnsupportedResultType,
+            error.Malformed => {
+                client.report(
+                    "mcp: {s} result did not decode as {s}; use exchange for the raw " ++
+                        "result: {s}\n",
+                    .{ method, @typeName(T), preview(bytes) },
+                );
+                return error.UnexpectedResult;
+            },
+        };
     }
 
     /// Reads messages until the response for `id` arrives, dispatching notifications
@@ -785,7 +1140,14 @@ pub const Client = struct {
 
             const message = jsonrpc.parseLeaky(arena, bytes) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => return error.Malformed,
+                else => {
+                    client.report(
+                        "mcp: transport delivered something that is not a JSON-RPC " ++
+                            "message ({s}): {s}\n",
+                        .{ @errorName(err), preview(bytes) },
+                    );
+                    return error.InvalidReply;
+                },
             };
 
             switch (message) {
@@ -829,19 +1191,62 @@ pub const Client = struct {
                 .request => continue,
             }
         }
+        // Every message read was somebody else's. The response may still be coming, but
+        // a caller must not be held here indefinitely on the chance that it is.
+        client.report(
+            "mcp: no response to request {f} within {d} messages\n",
+            .{ id, client.options.messages_max },
+        );
         return error.NoResponse;
     }
 };
 
-/// Maps a JSON-RPC error onto a client error, singling out the one a caller can act
-/// on automatically.
-fn failureError(failure: ?jsonrpc.ErrorObject) Error {
-    const object = failure orelse return error.Malformed;
-    if (object.code == jsonrpc.error_code.unsupported_protocol_version) {
-        return error.UnsupportedProtocolVersion;
-    }
-    return error.RequestFailed;
+/// How much of a peer's bytes a diagnostic line will quote.
+///
+/// Enough to recognise the payload, short enough that one bad message cannot flood a
+/// log with content the peer chose.
+const preview_bytes_max = 512;
+
+fn preview(bytes: []const u8) []const u8 {
+    return bytes[0..@min(bytes.len, preview_bytes_max)];
 }
+
+/// Writes object members with the commas in the right places.
+///
+/// The encoder emits JSON directly rather than building an `ObjectMap` first, and
+/// getting a separator wrong produces bytes no server will accept. Tracking "have I
+/// written one yet" in one place is what keeps that from being spread across the
+/// callers.
+const Members = struct {
+    writer: *std.Io.Writer,
+    written: bool = false,
+
+    fn separate(members: *Members) error{OutOfMemory}!void {
+        if (members.written) members.writer.writeAll(",") catch return error.OutOfMemory;
+        members.written = true;
+    }
+
+    fn field(
+        members: *Members,
+        name: []const u8,
+        value: anytype,
+    ) error{OutOfMemory}!void {
+        try members.separate();
+        types.stringify(members.writer, name) catch return error.OutOfMemory;
+        members.writer.writeAll(":") catch return error.OutOfMemory;
+        types.stringify(members.writer, value) catch return error.OutOfMemory;
+    }
+
+    /// Appends already-encoded members: the interior of an object, without its braces.
+    ///
+    /// An empty interior writes nothing at all, and in particular does not leave behind
+    /// a comma with nothing after it.
+    fn raw(members: *Members, interior: []const u8) error{OutOfMemory}!void {
+        if (interior.len == 0) return;
+        try members.separate();
+        members.writer.writeAll(interior) catch return error.OutOfMemory;
+    }
+};
 
 fn mapSendError(err: Transport.SendError) Error {
     return switch (err) {
@@ -856,15 +1261,8 @@ fn mapReceiveError(err: Transport.ReceiveError) Error {
     return switch (err) {
         error.TransportFailed => error.TransportFailed,
         error.MessageTooLarge => error.MessageTooLarge,
+        error.Timeout => error.Timeout,
         error.OutOfMemory => error.OutOfMemory,
-    };
-}
-
-fn mapDecode(result: anytype) Error!@typeInfo(@TypeOf(result)).error_union.payload {
-    return result catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.Malformed => error.Malformed,
-        error.UnsupportedResultType => error.UnsupportedResultType,
     };
 }
 
@@ -1411,7 +1809,7 @@ test "the exchange helper exposes the error object for inspection" {
     const call = try fixture.client.exchange(
         fixture.allocator(),
         types.method.tools_list,
-        null,
+        .none,
         .{},
     );
     try testing.expect(!call.succeeded());
@@ -1480,15 +1878,23 @@ test "a flood of notifications cannot make a client wait forever" {
     );
 }
 
-test "a malformed reply is reported rather than misread" {
+test "a reply that is not JSON-RPC is the transport's fault, and says so" {
+    var log: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer log.deinit();
+
     var fixture: Fixture = undefined;
-    fixture.init(&.{"{not json"}, .{});
+    fixture.init(&.{"{not json"}, .{ .diagnostics = &log.writer });
     defer fixture.deinit();
 
+    // `InvalidReply`, not `UnexpectedResult`: the bytes never became a message, so
+    // there is no result to have been unexpected.
     try testing.expectError(
-        error.Malformed,
+        error.InvalidReply,
         fixture.client.listTools(fixture.allocator(), .{}),
     );
+    // The offending bytes are quoted, which is the whole point of the channel: an
+    // error name alone leaves a caller guessing what the peer actually sent.
+    try testing.expect(std.mem.indexOf(u8, log.written(), "{not json") != null);
 }
 
 test "a result missing resultType reads as complete" {
@@ -1542,17 +1948,25 @@ test "input_required is still explicit when resultType is absent elsewhere" {
     );
 }
 
-test "a result of the wrong shape is malformed rather than silently empty" {
+test "a result of the wrong shape is reported rather than silently empty" {
+    var log: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer log.deinit();
+
     var fixture: Fixture = undefined;
     fixture.init(&.{
         \\{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","tools":"not an array"}}
-    }, .{});
+    }, .{ .diagnostics = &log.writer });
     defer fixture.deinit();
 
+    // A well-formed JSON-RPC response whose payload is not the promised type: the
+    // server is at fault, and the caller has a way to read it anyway.
     try testing.expectError(
-        error.Malformed,
+        error.UnexpectedResult,
         fixture.client.listTools(fixture.allocator(), .{}),
     );
+    try testing.expect(std.mem.indexOf(u8, log.written(), "tools/list") != null);
+    try testing.expect(std.mem.indexOf(u8, log.written(), "exchange") != null);
+    try testing.expect(std.mem.indexOf(u8, log.written(), "not an array") != null);
 }
 
 test "transport failures propagate" {
@@ -1656,7 +2070,7 @@ test "a caller-supplied _meta cannot displace the protocol's" {
         types.CallToolResult,
         fixture.allocator(),
         types.method.tools_call,
-        .{ .object = params },
+        .{ .value = .{ .object = params } },
         .{},
     );
 
@@ -1664,6 +2078,193 @@ test "a caller-supplied _meta cannot displace the protocol's" {
     // caller's copy is dropped.
     const sent = try fixture.lastSent();
     try testing.expect(sent.get("params").?.object.get("_meta").? == .object);
+}
+
+test "pre-encoded params go out byte for byte" {
+    var fixture: Fixture = undefined;
+    fixture.init(&.{
+        \\{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","tools":[]}}
+    }, .{});
+    defer fixture.deinit();
+
+    // Every one of these survives a round trip through `std.json.Value` differently:
+    // the trailing zero is dropped, the exponent is reformatted, the integer exceeds
+    // i64 and becomes a float, and the key order is whatever the map iterates in.
+    const raw = "{\"zebra\":1.50,\"alpha\":1e2,\"huge\":12345678901234567890123}";
+
+    _ = try fixture.client.exchange(
+        fixture.allocator(),
+        types.method.tools_list,
+        .{ .raw = raw },
+        .{},
+    );
+
+    const sent = fixture.transport.sent.items[0];
+    try testing.expect(std.mem.indexOf(u8, sent, raw[1 .. raw.len - 1]) != null);
+    // Spliced into the same object as `_meta`, not appended after it.
+    try testing.expect(std.mem.indexOf(u8, sent, types.meta_key.protocol_version) != null);
+    const params = (try fixture.lastSent()).get("params").?.object;
+    try testing.expectEqual(@as(usize, 4), params.count());
+}
+
+test "an empty pre-encoded object adds nothing, including a stray comma" {
+    var fixture: Fixture = undefined;
+    fixture.init(&.{
+        \\{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","tools":[]}}
+    }, .{});
+    defer fixture.deinit();
+
+    // `{ }` rather than `{}`, so the whitespace trimming is exercised too. A comma
+    // left behind here would make the whole message unparseable, which is why the
+    // assertion is that it parses at all.
+    _ = try fixture.client.exchange(
+        fixture.allocator(),
+        types.method.tools_list,
+        .{ .raw = "{  }" },
+        .{},
+    );
+
+    const params = (try fixture.lastSent()).get("params").?.object;
+    try testing.expectEqual(@as(usize, 1), params.count());
+    try testing.expect(params.get("_meta") != null);
+}
+
+test "params that are not an object are refused before anything is sent" {
+    for ([_]Params{
+        .{ .raw = "[1,2]" },
+        .{ .raw = "" },
+        .{ .raw = "{" },
+        .{ .value = .{ .array = std.json.Array.init(testing.allocator) } },
+        .{ .value = .{ .string = "name=x" } },
+    }) |params| {
+        var log: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer log.deinit();
+
+        var fixture: Fixture = undefined;
+        fixture.init(&.{}, .{ .diagnostics = &log.writer });
+        defer fixture.deinit();
+
+        try testing.expectError(error.InvalidParams, fixture.client.exchange(
+            fixture.allocator(),
+            types.method.tools_list,
+            params,
+            .{},
+        ));
+        // The caller's fault, so it is caught before a request goes out — a server
+        // should not have to be the one to notice.
+        try testing.expectEqual(@as(usize, 0), fixture.transport.sent.items.len);
+        try testing.expect(std.mem.indexOf(u8, log.written(), "tools/list") != null);
+    }
+}
+
+test "callToolJson passes the model's arguments through unchanged" {
+    var fixture: Fixture = undefined;
+    fixture.init(&.{
+        \\{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","content":[]}}
+    }, .{});
+    defer fixture.deinit();
+
+    _ = try fixture.client.callToolJson(
+        fixture.allocator(),
+        "transfer",
+        "  {\"cents\":900000000000000000000,\"memo\":\"rent\"}  ",
+        .{},
+    );
+
+    const sent = fixture.transport.sent.items[0];
+    try testing.expect(std.mem.indexOf(u8, sent, "900000000000000000000") != null);
+
+    const params = (try fixture.lastSent()).get("params").?.object;
+    try testing.expectEqualStrings("transfer", params.get("name").?.string);
+    try testing.expectEqualStrings("rent", params.get("arguments").?.object.get("memo").?.string);
+}
+
+test "callToolJson with no arguments omits the member rather than sending nothing" {
+    var fixture: Fixture = undefined;
+    fixture.init(&.{
+        \\{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","content":[]}}
+    }, .{});
+    defer fixture.deinit();
+
+    // A tool that takes no arguments. `"arguments":` with nothing after it would be
+    // the failure mode here, and it would break the whole message.
+    _ = try fixture.client.callToolJson(fixture.allocator(), "ping", "   ", .{});
+
+    const params = (try fixture.lastSent()).get("params").?.object;
+    try testing.expectEqualStrings("ping", params.get("name").?.string);
+    try testing.expect(params.get("arguments") == null);
+}
+
+test "a retry splices answers beside pre-encoded params" {
+    var elicitor: ScriptedElicitor = .{ .gpa = testing.allocator };
+    defer elicitor.deinit();
+
+    var fixture: Fixture = undefined;
+    fixture.init(&.{
+        \\{"jsonrpc":"2.0","id":1,"result":{"resultType":"input_required",
+        \\ "inputRequests":{"where":{"method":"elicitation/create",
+        \\  "params":{"mode":"form","message":"Where?",
+        \\   "requestedSchema":{"type":"object","properties":{"answer":{"type":"string"}}}}}},
+        \\ "requestState":"opaque-state"}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[]}}
+    }, .{
+        .elicitor = elicitor.elicitor(),
+        .capabilities = elicitation_capable,
+    });
+    defer fixture.deinit();
+
+    _ = try fixture.client.callToolInteractiveJson(
+        fixture.allocator(),
+        "forecast",
+        "{\"days\":1.0}",
+        .{},
+    );
+
+    // The caller's text is still verbatim on the retry — the answers went beside it,
+    // not through a parse of it.
+    const retry = fixture.transport.sent.items[1];
+    try testing.expect(std.mem.indexOf(u8, retry, "\"days\":1.0") != null);
+
+    const params = (try fixture.lastSent()).get("params").?.object;
+    try testing.expectEqualStrings("forecast", params.get("name").?.string);
+    try testing.expectEqualStrings("opaque-state", params.get("requestState").?.string);
+    try testing.expect(params.get("inputResponses").?.object.get("where") != null);
+}
+
+test "a server's error is explained, not just named" {
+    var log: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer log.deinit();
+
+    var fixture: Fixture = undefined;
+    fixture.init(&.{
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32602,
+        \\ "message":"unknown argument: regoin"}}
+    }, .{ .diagnostics = &log.writer });
+    defer fixture.deinit();
+
+    try testing.expectError(
+        error.RequestFailed,
+        fixture.client.callTool(fixture.allocator(), "forecast", null, .{}),
+    );
+    // The server said what was wrong. `error.RequestFailed` cannot carry it, so the
+    // channel is the only place a caller can read it.
+    try testing.expect(std.mem.indexOf(u8, log.written(), "-32602") != null);
+    try testing.expect(std.mem.indexOf(u8, log.written(), "regoin") != null);
+}
+
+test "an error response with no error object is an invalid reply" {
+    var fixture: Fixture = undefined;
+    fixture.init(&.{
+        \\{"jsonrpc":"2.0","id":1}
+    }, .{});
+    defer fixture.deinit();
+
+    // Neither `result` nor `error`: not a response at all, whatever it parsed as.
+    try testing.expectError(
+        error.InvalidReply,
+        fixture.client.listTools(fixture.allocator(), .{}),
+    );
 }
 
 test "every request the client emits is well-formed JSON-RPC" {
@@ -2053,12 +2654,12 @@ test "input_required on a method that may not use it is malformed" {
     // The spec permits this on exactly three methods. Retrying a listing with extra
     // input cannot converge, so following the server here would only produce a loop.
     try testing.expectError(
-        error.Malformed,
+        error.UnexpectedResult,
         fixture.client.requestInteractive(
             types.ListToolsResult,
             fixture.allocator(),
             types.method.tools_list,
-            null,
+            .none,
             .{},
         ),
     );
@@ -2074,7 +2675,7 @@ test "an input_required result with neither field is malformed" {
     // With neither, the client has nothing to change and would retry the identical
     // request forever.
     try testing.expectError(
-        error.Malformed,
+        error.UnexpectedResult,
         fixture.client.callToolInteractive(fixture.allocator(), "x", null, .{}),
     );
 }

@@ -302,30 +302,41 @@ fn emitClientRequests(gpa: std.mem.Allocator, out: *std.Io.Writer) !void {
     var listen_params: std.json.ObjectMap = .empty;
     try listen_params.put(scratch, "notifications", .{ .object = listen_filter });
 
+    const call_params_json =
+        "{\"name\":\"get_forecast\",\"arguments\":{\"city\":\"Reykjavik\"}}";
+
     const cases = [_]struct {
         def: []const u8,
         method: []const u8,
-        params: ?std.json.Value,
+        params: mcp.client.Params,
         options: mcp.client.CallOptions = .{},
     }{
-        .{ .def = "DiscoverRequest", .method = types.method.discover, .params = null },
-        .{ .def = "ListToolsRequest", .method = types.method.tools_list, .params = null },
+        .{ .def = "DiscoverRequest", .method = types.method.discover, .params = .none },
+        .{ .def = "ListToolsRequest", .method = types.method.tools_list, .params = .none },
         .{
             .def = "CallToolRequest",
             .method = types.method.tools_call,
-            .params = .{ .object = call_params },
+            .params = .{ .value = .{ .object = call_params } },
             // The per-call opt-ins live in `_meta`, so exercise them here too.
             .options = .{ .progress_token = .{ .string = "sample" }, .log_level = .info },
         },
         .{
+            // The same request, from pre-encoded params. Splicing text into the object
+            // `_meta` also lives in is the one path that can put a stray comma or a
+            // duplicate brace on the wire, and the schema is what catches it.
+            .def = "CallToolRequest",
+            .method = types.method.tools_call,
+            .params = .{ .raw = call_params_json },
+        },
+        .{
             .def = "ReadResourceRequest",
             .method = types.method.resources_read,
-            .params = .{ .object = read_params },
+            .params = .{ .value = .{ .object = read_params } },
         },
         .{
             .def = "SubscriptionsListenRequest",
             .method = types.method.subscriptions_listen,
-            .params = .{ .object = listen_params },
+            .params = .{ .value = .{ .object = listen_params } },
         },
     };
 
