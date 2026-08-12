@@ -84,13 +84,14 @@ pub const Event = union(enum) {
 /// the broker's lifetime and a `*Subscriber` never dangles. What it can do is become
 /// closed, which is what `active` records.
 pub const Subscriber = struct {
-    /// The subscription id: the listen request's JSON-RPC id.
+    /// The subscription id: the listen request's JSON-RPC id. Owned by the broker —
+    /// a string id is duplicated out of the request arena, because it is written into
+    /// every message this subscription ever sends.
     id: jsonrpc.Id = .{ .number = 0 },
     /// What the server agreed to honour. Delivery consults only this, never what the
     /// client originally asked for, so an ungranted type cannot leak out.
     granted: types.SubscriptionFilter = .{},
-    /// Storage for the granted URIs, copied so that the subscription does not depend
-    /// on the request arena that parsed it.
+    /// The granted URIs, owned by the broker for the same reason as `id`.
     uri_storage: [uris_max][]const u8 = undefined,
     uri_count: usize = 0,
     /// Where notifications go. Null while the slot is free.
@@ -124,6 +125,42 @@ pub const Subscriber = struct {
 
     pub fn uris(subscriber: *const Subscriber) []const []const u8 {
         return subscriber.uri_storage[0..subscriber.uri_count];
+    }
+};
+
+/// The parts of a subscription request that have to outlive the message carrying it.
+///
+/// A `Listen` is decoded into a per-message arena and every transport recycles that
+/// arena as soon as the message is answered — while the subscription it opened is, by
+/// definition, still live. Copying only the slice headers into the slot left the id
+/// and every watched URI pointing at memory the next message overwrote: notifications
+/// went out carrying a garbage `subscriptionId`, and the URI filter decided who to
+/// deliver to by reading recycled bytes.
+const Owned = struct {
+    id: jsonrpc.Id,
+    uri_storage: [uris_max][]const u8 = undefined,
+    uri_count: usize = 0,
+
+    fn init(gpa: std.mem.Allocator, listen: server_mod.Listen) error{OutOfMemory}!Owned {
+        const granted_uris = listen.granted.uris();
+        assert(granted_uris.len <= uris_max);
+
+        var owned: Owned = .{ .id = try listen.id.clone(gpa) };
+        errdefer owned.deinit(gpa);
+
+        // `uri_count` advances with each success so that a failure part-way frees
+        // exactly what was taken.
+        for (granted_uris) |uri| {
+            owned.uri_storage[owned.uri_count] = try gpa.dupe(u8, uri);
+            owned.uri_count += 1;
+        }
+        return owned;
+    }
+
+    fn deinit(owned: *Owned, gpa: std.mem.Allocator) void {
+        owned.id.deinit(gpa);
+        for (owned.uri_storage[0..owned.uri_count]) |uri| gpa.free(uri);
+        owned.* = .{ .id = .{ .number = 0 } };
     }
 };
 
@@ -200,7 +237,15 @@ pub const Broker = struct {
         const granted_uris = listen.granted.uris();
         if (granted_uris.len > uris_max) return error.TooManyUris;
 
-        const subscriber = try broker.claim(listen, sink);
+        var owned: Owned = try .init(broker.gpa, listen);
+        // Ownership passes to the slot the moment `claim` succeeds, so the two cases
+        // are separated rather than layered as errdefers: releasing the slot already
+        // frees these bytes, and a second `deinit` on the way out would free them
+        // twice.
+        const subscriber = broker.claim(listen, &owned, sink) catch |err| {
+            owned.deinit(broker.gpa);
+            return err;
+        };
         errdefer broker.release(subscriber);
 
         // Encoded before the slot is active, so a publisher cannot interleave.
@@ -213,9 +258,15 @@ pub const Broker = struct {
     }
 
     /// Takes a free slot and fills it in, without making it visible to publishers.
+    ///
+    /// Takes the copies already made rather than making them here: allocating under
+    /// the table lock would stall every publisher on the machine for as long as the
+    /// allocator takes, and this module's contract is that the table's critical
+    /// sections are allocation-free scans.
     fn claim(
         broker: *Broker,
         listen: server_mod.Listen,
+        owned: *const Owned,
         sink: NotificationSink,
     ) SubscribeError!*Subscriber {
         broker.acquire();
@@ -225,20 +276,17 @@ pub const Broker = struct {
             if (slot.sink != null) continue;
 
             slot.* = .{
-                .id = listen.id,
+                .id = owned.id,
                 .granted = listen.granted,
                 .sink = sink,
                 // Not yet: `activate` publishes it.
                 .active = false,
             };
-            // The filter's URI slice points into the request arena, which outlives
-            // neither the stream nor the broker. Copy the slice headers into the
-            // slot; the bytes themselves are owned by the caller, which is
-            // documented on `subscribe`.
-            const granted_uris = listen.granted.uris();
-            assert(granted_uris.len <= uris_max);
-            for (granted_uris, 0..) |uri, index| slot.uri_storage[index] = uri;
-            slot.uri_count = granted_uris.len;
+            slot.uri_storage = owned.uri_storage;
+            slot.uri_count = owned.uri_count;
+            // Repointed at the slot's own copies. `listen.granted` still refers to the
+            // request arena, and the acknowledgement is encoded from this field.
+            //
             // Null, not an empty slice: omitting the field is how the spec expresses
             // "not subscribed", and an acknowledgement carrying `[]` would claim a
             // subscription that covers nothing.
@@ -264,9 +312,13 @@ pub const Broker = struct {
         subscriber.active = false;
         broker.releaseLock();
 
-        // Wait out any in-flight delivery, then blank the slot.
+        // Wait out any in-flight delivery, then blank the slot. Freeing before the
+        // wait would hand a publisher already inside `deliver` a freed id.
         lockSpin(&subscriber.delivery);
         subscriber.sink = null;
+        subscriber.id.deinit(broker.gpa);
+        subscriber.id = .{ .number = 0 };
+        for (subscriber.uris()) |uri| broker.gpa.free(uri);
         subscriber.uri_count = 0;
         subscriber.granted = .{};
         subscriber.delivery.unlock();
@@ -795,6 +847,63 @@ test "a released subscription stops receiving" {
 
     // Acknowledgement plus the one notification sent while live.
     try testing.expectEqual(@as(usize, 2), recorder.messages.items.len);
+}
+
+test "a subscription outlives the arena its request was parsed from" {
+    var recorder: Recorder = .{ .gpa = testing.allocator };
+    defer recorder.deinit();
+
+    var broker: Broker = .init(testing.allocator, null);
+
+    var arena_instance: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+
+    // Shaped like a message the transport just parsed: a string id and a watched URI,
+    // both borrowed from the arena that is about to be recycled.
+    const uris = try arena.alloc([]const u8, 1);
+    uris[0] = try arena.dupe(u8, "file:///project");
+    const borrowed_id = try arena.dupe(u8, "sub-7");
+    const subscriber = try broker.subscribe(.{
+        .id = .{ .string = borrowed_id },
+        .requested = .{ .resourceSubscriptions = uris },
+        .granted = .{ .resourceSubscriptions = uris },
+    }, recorder.sink());
+    defer broker.release(subscriber);
+
+    // What every transport does between messages, followed by the same sequence of
+    // allocations a second message would make. Repeating the sequence exactly is what
+    // puts the new bytes on top of the old ones — a single large allocation lands in a
+    // fresh node instead and clobbers nothing.
+    _ = arena_instance.reset(.retain_capacity);
+    @memset(std.mem.sliceAsBytes(try arena.alloc([]const u8, uris.len)), 0xaa);
+    @memset(try arena.alloc(u8, "file:///project".len), 0xaa);
+    @memset(try arena.alloc(u8, borrowed_id.len), 0xaa);
+    // Asserted rather than assumed: if the clobber missed, everything below would pass
+    // whether or not the broker made copies, and the test would prove nothing.
+    try testing.expect(!std.mem.eql(u8, borrowed_id, "sub-7"));
+
+    broker.publishResourceUpdated("file:///project/config.json");
+
+    try testing.expectEqual(@as(usize, 2), recorder.messages.items.len);
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        recorder.messages.items[1],
+        .{},
+    );
+    defer parsed.deinit();
+
+    const params = parsed.value.object.get("params").?.object;
+    // Reaching here at all means the URI filter matched on the broker's own copy.
+    try testing.expectEqualStrings("file:///project/config.json", params.get("uri").?.string);
+    try testing.expectEqualStrings(
+        "sub-7",
+        params.get("_meta").?.object.get(types.meta_key.subscription_id).?.string,
+    );
+
+    // And the id is still the one a `notifications/cancelled` would name.
+    try testing.expect(broker.cancel(.{ .string = "sub-7" }));
 }
 
 test "cancel by id, and cancelling an unknown id is not an error" {

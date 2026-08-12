@@ -110,15 +110,21 @@ pub const Options = struct {
     /// Off by default. A server legitimately publishes a resource identifier that
     /// differs from the URL a client happened to use — `https://mcp.example.com` for
     /// an endpoint at `https://mcp.example.com/mcp` — and since the document is what
-    /// *defines* the identifier, adopting it is correct. What protects that adoption
-    /// is `require_same_origin`, not string equality. Turn this on for a deployment
-    /// where the two are known to match.
+    /// *defines* the identifier, adopting it is correct. What bounds that adoption is
+    /// a same-origin check on the claimed resource that runs unconditionally and no
+    /// option disables; see `adoptableIdentifier`. Turn this on for a deployment where
+    /// the two are known to match, which is what the RFC asks for and costs nothing
+    /// when it holds.
     require_exact_resource: bool = false,
     /// Require a challenge's `resource_metadata` URL to share the resource's origin.
     ///
     /// On by default. The header is chosen by whoever answered the request, so without
     /// this a server can point a client at a metadata document of its choosing and
     /// from there at an authorization server of its choosing.
+    ///
+    /// This governs where a document may be *fetched from*. What the document may then
+    /// claim is a separate question, bounded unconditionally — turning this off widens
+    /// which documents are read, not which resources a token can be minted for.
     require_same_origin: bool = true,
     /// Ask for `offline_access` when the authorization server lists it, so that a
     /// refresh token is issued and the user is not re-prompted on every expiry.
@@ -220,16 +226,58 @@ pub const Client = struct {
             },
         };
 
-        if (client.options.require_exact_resource) {
-            metadata.matchesResource(client.options.resource) catch
-                return error.ResourceMetadataInvalid;
-        }
+        const identifier = adoptableIdentifier(client.options, &metadata) catch |err| {
+            client.report(
+                "oauth: metadata at {s} claims resource {s}, which this client will not adopt\n",
+                .{ metadata_url, metadata.resource },
+            );
+            return err;
+        };
 
         return .{
             .metadata = metadata,
             .metadata_url = metadata_url,
-            .identifier = metadata.resource,
+            .identifier = identifier,
         };
+    }
+
+    /// The identifier a fetched document establishes, if this client may adopt it.
+    ///
+    /// The document's `resource` becomes the `resource` parameter of every
+    /// authorization and token request this client makes, which is what the
+    /// authorization server writes into the token's audience. Adopting it unchecked is
+    /// a confused deputy: a server the user has legitimately connected to names some
+    /// third party's resource, and the authorization server mints a token whose
+    /// audience is that third party. The consent screen names the third party too, so
+    /// consent is no defense — the user cannot tell which of the two asked.
+    ///
+    /// The bound is therefore unconditional and no option relaxes it: a server may
+    /// redefine its own identifier and nothing else. Same-origin rather than byte
+    /// equality because redefinition is legitimate and common —
+    /// `https://mcp.example.com` for an endpoint at `https://mcp.example.com/mcp` — and
+    /// RFC 9728 Section 3.3's byte-exact rule is available as `require_exact_resource`
+    /// for a deployment that can hold to it.
+    ///
+    /// Pure, and separate from the fetch, so the rule is testable without a network.
+    fn adoptableIdentifier(
+        options: Options,
+        metadata: *const prm.ResourceMetadata,
+    ) error{ ResourceMetadataForeign, ResourceMetadataInvalid }![]const u8 {
+        // Checked here rather than left to the token request, which would refuse it two
+        // steps removed from the cause.
+        prm.validateResourceIdentifier(metadata.resource) catch
+            return error.ResourceMetadataInvalid;
+
+        if (!prm.sameOrigin(metadata.resource, options.resource)) {
+            return error.ResourceMetadataForeign;
+        }
+
+        if (options.require_exact_resource) {
+            metadata.matchesResource(options.resource) catch
+                return error.ResourceMetadataInvalid;
+        }
+
+        return metadata.resource;
     }
 
     /// Retrieves authorization server metadata for `issuer`.
@@ -402,7 +450,18 @@ pub const Client = struct {
         diagnosis: *Diagnosis,
     ) Error!token.TokenSet {
         const refresh_token = tokens.refresh_token orelse return error.TokenRequestRejected;
-        if (!tokens.boundTo(server.issuer, tokens.resource)) {
+        // Two conditions rather than `boundTo`, which has no argument here that would
+        // make it say anything: passing `tokens.resource` as the expected resource
+        // compares a value with itself, so the resource half of that check was always
+        // true and only the issuer was ever tested.
+        //
+        // The resource is compared by origin, not bytes, because the identifier may
+        // legitimately differ from the URL this client talks to — the same latitude
+        // `adoptableIdentifier` grants, and the same bound. What it catches is a token
+        // set restored from storage after the client was pointed somewhere else.
+        if (!std.mem.eql(u8, tokens.issuer, server.issuer) or
+            !prm.sameOrigin(tokens.resource, client.options.resource))
+        {
             client.report("oauth: refusing to refresh a token bound elsewhere\n", .{});
             return error.RegistrationUnavailable;
         }
@@ -669,6 +728,90 @@ test "discoverResource refuses a challenge pointing off-origin" {
         arena.allocator(),
         "https://attacker.example/.well-known/oauth-protected-resource",
     ));
+}
+
+test "a document may redefine its own resource but not name someone else's" {
+    const options = testClient(undefined).options;
+
+    // The legitimate case, and the reason this is not byte equality: the endpoint is
+    // at /mcp and the identifier the document establishes is the origin.
+    const redefined: prm.ResourceMetadata = .{
+        .resource = "https://mcp.example.com",
+        .authorization_servers = &.{"https://auth.example.com"},
+    };
+    try std.testing.expectEqualStrings(
+        "https://mcp.example.com",
+        try Client.adoptableIdentifier(options, &redefined),
+    );
+
+    // The attack. This document is served from the origin the client is talking to, so
+    // every check that came before it passes; what it claims is that the token should
+    // be minted for somebody else. The authorization server would honour that, and the
+    // consent screen would name the third party rather than the server that asked —
+    // so the user cannot tell the difference and consent protects nothing.
+    const foreign: prm.ResourceMetadata = .{
+        .resource = "https://bank.example.com/api",
+        .authorization_servers = &.{"https://auth.example.com"},
+    };
+    try std.testing.expectError(
+        error.ResourceMetadataForeign,
+        Client.adoptableIdentifier(options, &foreign),
+    );
+
+    // Origin is scheme, host, and port — each on its own is enough to be a third party.
+    for ([_][]const u8{
+        "http://mcp.example.com/mcp",
+        "https://mcp.example.com:8443/mcp",
+        "https://evil.mcp.example.com/mcp",
+    }) |claimed| {
+        const metadata: prm.ResourceMetadata = .{
+            .resource = claimed,
+            .authorization_servers = &.{"https://auth.example.com"},
+        };
+        try std.testing.expectError(
+            error.ResourceMetadataForeign,
+            Client.adoptableIdentifier(options, &metadata),
+        );
+    }
+}
+
+test "an adopted identifier is refused early if it is not canonical" {
+    const options = testClient(undefined).options;
+
+    // Same origin, but unusable as a `resource` parameter. Caught here rather than by
+    // the token request, which would refuse it two steps removed from the cause.
+    const fragment: prm.ResourceMetadata = .{
+        .resource = "https://mcp.example.com/mcp#frag",
+        .authorization_servers = &.{"https://auth.example.com"},
+    };
+    try std.testing.expectError(
+        error.ResourceMetadataInvalid,
+        Client.adoptableIdentifier(options, &fragment),
+    );
+}
+
+test "require_exact_resource additionally demands byte equality" {
+    var options = testClient(undefined).options;
+    options.require_exact_resource = true;
+
+    const redefined: prm.ResourceMetadata = .{
+        .resource = "https://mcp.example.com",
+        .authorization_servers = &.{"https://auth.example.com"},
+    };
+    // Adoptable by origin, refused by the RFC 9728 Section 3.3 rule this option turns on.
+    try std.testing.expectError(
+        error.ResourceMetadataInvalid,
+        Client.adoptableIdentifier(options, &redefined),
+    );
+
+    const exact: prm.ResourceMetadata = .{
+        .resource = "https://mcp.example.com/mcp",
+        .authorization_servers = &.{"https://auth.example.com"},
+    };
+    try std.testing.expectEqualStrings(
+        "https://mcp.example.com/mcp",
+        try Client.adoptableIdentifier(options, &exact),
+    );
 }
 
 test "discoverResource rejects a resource this client cannot use" {

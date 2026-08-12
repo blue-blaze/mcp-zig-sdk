@@ -407,7 +407,12 @@ pub fn checkClaims(claims: *const Claims, expectations: Expectations) Error!void
         if (expectations.now + leeway < nbf) return error.NotYetValid;
     }
     if (claims.iat) |iat| {
-        if (iat - expectations.now > issued_at_future_seconds_max) return error.NotYetValid;
+        // Saturating: `iat` is a number from the token, so `minInt(i64) - now` traps
+        // and a claims check becomes a crash. This is the only comparison here whose
+        // arithmetic touches a claim rather than the caller's own clock. Saturating
+        // low is also the right answer — an `iat` far in the past is not a reason to
+        // call a token premature, and `exp` is what bounds that end.
+        if (iat -| expectations.now > issued_at_future_seconds_max) return error.NotYetValid;
     }
 
     // Last, because a token that is expired or for another audience should report
@@ -783,6 +788,23 @@ test "checkClaims honors nbf and rejects an implausible iat" {
 
     claims.nbf = null;
     claims.iat = test_now + issued_at_future_seconds_max + 1;
+    try std.testing.expectError(error.NotYetValid, checkClaims(&claims, testExpectations()));
+}
+
+test "checkClaims survives an iat at either end of the range" {
+    var claims: Claims = .{
+        .iss = test_issuer,
+        .aud = &.{test_audience},
+        .exp = test_now + 300,
+        // Subtracting the clock from this used to trap, so a token could crash its
+        // verifier instead of being refused by it.
+        .iat = std.math.minInt(i64),
+    };
+    // Far in the past is not premature — `exp` is what rejects a stale token, and this
+    // one has a good `exp`.
+    try checkClaims(&claims, testExpectations());
+
+    claims.iat = std.math.maxInt(i64);
     try std.testing.expectError(error.NotYetValid, checkClaims(&claims, testExpectations()));
 }
 

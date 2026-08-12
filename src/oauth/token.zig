@@ -291,7 +291,9 @@ pub const TokenSet = struct {
         leeway_seconds: i64,
     ) bool {
         const expires_at = tokens.expires_at orelse return false;
-        return now + leeway_seconds >= expires_at;
+        // Saturating so that a set whose `expires_at` saturated on the way in stays
+        // readable here rather than trapping on the comparison's other side.
+        return now +| leeway_seconds >= expires_at;
     }
 
     pub fn hasScope(tokens: *const TokenSet, token: []const u8) bool {
@@ -378,7 +380,14 @@ pub fn parseResponse(
     return .{
         .access_token = access_token,
         .refresh_token = wire.refresh_token,
-        .expires_at = if (wire.expires_in) |seconds| context.now + seconds else null,
+        // Saturating, because `expires_in` is a number chosen by the peer and this is
+        // the only place it is arithmetic: `now + maxInt(i64)` traps, which turns a
+        // token response into a crashed process. Saturating reads an absurd lifetime
+        // as "effectively never", which costs at most a 401 the client already knows
+        // how to recover from — the same trade this file makes for a string
+        // `expires_in`. Rejecting the response instead would discard a working token
+        // over a field that only decides when to refresh.
+        .expires_at = if (wire.expires_in) |seconds| context.now +| seconds else null,
         .scopes = granted,
         .issuer = context.issuer,
         .resource = context.resource,
@@ -716,6 +725,40 @@ test "a stringly-typed expires_in is accepted rather than discarding the token" 
     // only means refreshing at the wrong moment. Some authorization servers really do
     // emit it as a string, and rejecting the whole response over it would throw away
     // a perfectly good access token.
+}
+
+test "an expires_in that would overflow the clock does not crash the process" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var failure: ?Failure = null;
+    const context: ParseContext = .{ .issuer = test_issuer, .resource = test_resource, .now = test_now };
+
+    // A token endpoint reachable before any of its answers are trusted, so this is a
+    // remote crash with no prerequisite beyond being pointed at a hostile server.
+    const huge = try parseResponse(
+        allocator,
+        "{\"access_token\":\"at\",\"token_type\":\"Bearer\",\"expires_in\":9223372036854775807}",
+        context,
+        &failure,
+    );
+    try std.testing.expectEqual(std.math.maxInt(i64), huge.expires_at.?);
+    // Saturated means "effectively never", and asking that question must not trap either.
+    try std.testing.expect(!huge.isExpired(test_now, expiry_leeway_seconds_default));
+    // At a clock that has reached the saturated instant, the leeway saturates too and
+    // the answer is "expired" — which is the honest one, and reached without trapping.
+    try std.testing.expect(huge.isExpired(std.math.maxInt(i64) - 1, expiry_leeway_seconds_default));
+
+    // The other end of the range: a negative lifetime is honest about being spent
+    // rather than wrapping into the far future.
+    const negative = try parseResponse(
+        allocator,
+        "{\"access_token\":\"at\",\"token_type\":\"Bearer\",\"expires_in\":-9223372036854775808}",
+        context,
+        &failure,
+    );
+    try std.testing.expectEqual(test_now +| std.math.minInt(i64), negative.expires_at.?);
+    try std.testing.expect(negative.isExpired(test_now, 0));
 }
 
 test "TokenSet expiry accounts for leeway and for an absent expiry" {
