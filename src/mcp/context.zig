@@ -123,6 +123,10 @@ pub const Context = struct {
     /// Untrusted: it travelled through the client. See `mcp.request_state.Sealer`
     /// for a representation whose tampering is detectable.
     incoming_state: ?[]const u8 = null,
+    /// `params.context.arguments` on a `completion/complete` request: the variables of
+    /// this prompt or URI template the client has already filled in. Read it with
+    /// `resolvedArgument`.
+    resolved_arguments: ?std.json.ObjectMap = null,
     /// Input requests the handler has asked for, accumulated by `elicit*`.
     pending_requests: std.json.ObjectMap = .empty,
     /// State the handler wants echoed back, set by `needInput`.
@@ -327,6 +331,25 @@ pub const Context = struct {
     pub fn elicited(context: *const Context, key: []const u8) ?types.ElicitResult {
         const value = context.inputResponse(key) orelse return null;
         return types.ElicitResult.fromValue(value) catch null;
+    }
+
+    /// A variable the client has already resolved, on a `completion/complete` request.
+    ///
+    /// Completing `{table}` in `db://{schema}/{table}` is a different query for each
+    /// schema, so a completion handler that ignores this answers the wrong question
+    /// whenever more than one variable is in play. Null means the client sent no context
+    /// for that name, which is not an error — it may simply not have resolved it yet.
+    ///
+    /// Untrusted, like any request field: it is whatever the client typed, not a value
+    /// this server produced.
+    pub fn resolvedArgument(context: *const Context, name: []const u8) ?[]const u8 {
+        const arguments = context.resolved_arguments orelse return null;
+        return switch (arguments.get(name) orelse return null) {
+            .string => |string| string,
+            // The schema types these as strings. Anything else is the client's mistake,
+            // and coercing it would invent a prefix the user never typed.
+            else => null,
+        };
     }
 
     /// Asks the client to collect structured data from the user.

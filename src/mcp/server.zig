@@ -379,6 +379,23 @@ pub const Server = struct {
     /// null: there is no per-entity requirement to read, and inventing one here would
     /// hide it from the place that configures the baseline.
     pub fn requiredScopes(server: *const Server, rpc: jsonrpc.Request) ?[]const u8 {
+        // `completion/complete` addresses a prompt or a template through `params.ref`
+        // rather than through `Mcp-Name`, so `subjectOf` — which answers the header's
+        // question — does not see it. Answering null here was a privilege escalation:
+        // completing an argument of a prompt that requires `admin` runs that prompt's
+        // completion handler, which is the code that enumerates the very values the
+        // scope exists to protect.
+        if (std.mem.eql(u8, rpc.method, types.method.completion_complete)) {
+            return switch (server.completionTarget(rpc.params)) {
+                .found => |found| found.scopes,
+                // Malformed, or naming nothing registered. Dispatch is about to refuse
+                // it with `InvalidParams`, and there is no entity whose requirement
+                // could be read — the same answer `tools_call` gives for an unknown
+                // tool.
+                else => null,
+            };
+        }
+
         const subject = subjectOf(rpc) orelse return null;
 
         if (std.mem.eql(u8, rpc.method, types.method.tools_call)) {
@@ -647,6 +664,65 @@ pub const Server = struct {
         return server.resultReply(arena, request.id, result);
     }
 
+    /// What a `completion/complete` request completes against.
+    const CompletionTarget = struct {
+        scopes: ?[]const u8,
+        completion: ?registry_mod.CompletionHandler,
+    };
+
+    /// The outcome of resolving `params.ref`, kept separate from the reply so both
+    /// callers see the same three cases.
+    const CompletionLookup = union(enum) {
+        found: CompletionTarget,
+        /// `params` or `params.ref` is absent or not a well-formed reference.
+        malformed,
+        /// A well-formed `ref/prompt` naming no registered prompt.
+        unknown_prompt: []const u8,
+        /// A well-formed `ref/resource` matching no registered template.
+        unknown_template: []const u8,
+    };
+
+    /// Resolves a `completion/complete` reference to the entity that will answer it.
+    ///
+    /// One lookup for two questions: `handleComplete` needs the handler and
+    /// `requiredScopes` needs the scopes. If they resolved separately, a caller could be
+    /// authorized against one prompt and completed against another — which is the same
+    /// reason `subjectOf` is shared rather than reimplemented per transport.
+    fn completionTarget(server: *const Server, params: ?std.json.Value) CompletionLookup {
+        const object = objectOf(params) orelse return .malformed;
+        const reference = types.CompletionReference.fromValue(
+            object.get("ref") orelse std.json.Value{ .null = {} },
+        ) catch return .malformed;
+
+        switch (reference) {
+            .prompt => |prompt_reference| {
+                const definition = server.registry.findPrompt(prompt_reference.name) orelse
+                    return .{ .unknown_prompt = prompt_reference.name };
+                return .{ .found = .{
+                    .scopes = definition.scopes,
+                    .completion = definition.completion,
+                } };
+            },
+            .resource => |resource_reference| {
+                const template = server.registry.matchResourceTemplate(resource_reference.uri) orelse
+                    return .{ .unknown_template = resource_reference.uri };
+                return .{ .found = .{
+                    .scopes = template.scopes,
+                    .completion = template.completion,
+                } };
+            },
+        }
+    }
+
+    /// The most values `completion/complete` may return, from the schema:
+    /// `CompleteResult.completion.values` carries `maxItems: 100`.
+    ///
+    /// Enforced here rather than left to the handler because a handler that returns 200
+    /// candidates is not wrong about its own data — it just cannot know the wire limit,
+    /// and the reply that carried them would be a payload no conforming client has to
+    /// accept.
+    const completion_values_max = 100;
+
     fn handleComplete(
         server: *const Server,
         arena: std.mem.Allocator,
@@ -660,14 +736,27 @@ pub const Server = struct {
             "params is required",
         );
 
-        const reference = types.CompletionReference.fromValue(
-            params.get("ref") orelse std.json.Value{ .null = {} },
-        ) catch return server.errorReply(
-            arena,
-            request.id,
-            jsonrpc.error_code.invalid_params,
-            "params.ref is missing or malformed",
-        );
+        const target = switch (server.completionTarget(request.params)) {
+            .found => |found| found,
+            .malformed => return server.errorReply(
+                arena,
+                request.id,
+                jsonrpc.error_code.invalid_params,
+                "params.ref is missing or malformed",
+            ),
+            .unknown_prompt => |name| return server.errorReply(
+                arena,
+                request.id,
+                jsonrpc.error_code.invalid_params,
+                try std.fmt.allocPrint(arena, "unknown prompt: {s}", .{name}),
+            ),
+            .unknown_template => |uri| return server.errorReply(
+                arena,
+                request.id,
+                jsonrpc.error_code.invalid_params,
+                try std.fmt.allocPrint(arena, "unknown resource template: {s}", .{uri}),
+            ),
+        };
 
         const argument = objectOf(params.get("argument")) orelse return server.errorReply(
             arena,
@@ -681,42 +770,27 @@ pub const Server = struct {
             jsonrpc.error_code.invalid_params,
             "params.argument.name is required",
         );
-        const partial = stringField(argument, "value") orelse "";
+        // Required by the schema, and reading an absent one as "" would answer a
+        // different question than the one asked: it completes against the empty prefix,
+        // so a client that mis-spelled the field gets the whole candidate list back and
+        // no indication it sent a malformed request.
+        const partial = stringField(argument, "value") orelse return server.errorReply(
+            arena,
+            request.id,
+            jsonrpc.error_code.invalid_params,
+            "params.argument.value is required",
+        );
 
-        const handler = switch (reference) {
-            .prompt => |prompt_reference| blk: {
-                const definition = server.registry.findPrompt(prompt_reference.name) orelse
-                    return server.errorReply(
-                        arena,
-                        request.id,
-                        jsonrpc.error_code.invalid_params,
-                        try std.fmt.allocPrint(
-                            arena,
-                            "unknown prompt: {s}",
-                            .{prompt_reference.name},
-                        ),
-                    );
-                break :blk definition.completion;
-            },
-            .resource => |resource_reference| blk: {
-                const template = server.registry.matchResourceTemplate(resource_reference.uri) orelse
-                    return server.errorReply(
-                        arena,
-                        request.id,
-                        jsonrpc.error_code.invalid_params,
-                        try std.fmt.allocPrint(
-                            arena,
-                            "unknown resource template: {s}",
-                            .{resource_reference.uri},
-                        ),
-                    );
-                break :blk template.completion;
-            },
-        };
+        // Variables already resolved in the same prompt or URI template. Completing
+        // `{table}` in `db://{schema}/{table}` is a different query for each schema, and
+        // without this the handler cannot tell which one it is being asked about.
+        if (objectOf(params.get("context"))) |completion_context| {
+            context.resolved_arguments = objectOf(completion_context.get("arguments"));
+        }
 
         // Nothing registered to complete against is not an error: an empty list is
         // a valid answer, and it keeps a client's UI from breaking.
-        const values = if (handler) |complete|
+        const values = if (target.completion) |complete|
             complete(context, argument_name, partial) catch |err| {
                 return server.inputReply(
                     arena,
@@ -729,11 +803,14 @@ pub const Server = struct {
         else
             &[_][]const u8{};
 
+        // `total` is the number available, which the schema says may exceed what is
+        // sent; `hasMore` says the difference is not zero.
+        const sent = @min(values.len, completion_values_max);
         return server.resultReply(arena, request.id, types.CompleteResult{
             .completion = .{
-                .values = values,
+                .values = values[0..sent],
                 .total = @intCast(values.len),
-                .hasMore = false,
+                .hasMore = sent < values.len,
             },
             .meta = server.resultMeta(),
         });
@@ -1269,6 +1346,36 @@ fn completeWho(
         }
     }
     return matches.items;
+}
+
+/// Returns more candidates than the wire allows, which is a reasonable thing for a
+/// handler to do — it knows its data, not the protocol's limits.
+fn completeManyThings(
+    context: *Context,
+    _: []const u8,
+    _: []const u8,
+) Error![]const []const u8 {
+    const values = try context.arena.alloc([]const u8, 150);
+    for (values, 0..) |*slot, index| {
+        slot.* = try context.print("candidate-{d}", .{index});
+    }
+    return values;
+}
+
+/// Completes `{table}` in `db://{schema}/{table}`, which is only answerable once the
+/// schema is known.
+fn completeTable(
+    context: *Context,
+    _: []const u8,
+    _: []const u8,
+) Error![]const []const u8 {
+    const values = try context.arena.alloc([]const u8, 1);
+    const schema = context.resolvedArgument("schema") orelse {
+        values[0] = "<no schema>";
+        return values;
+    };
+    values[0] = try context.print("{s}.orders", .{schema});
+    return values;
 }
 
 /// A server plus registry plus arena, wired up for one test.
@@ -1982,6 +2089,111 @@ test "completion/complete returns an empty list when nothing can complete" {
     try testing.expectEqual(@as(usize, 0), values.items.len);
 }
 
+test "completion/complete caps the values at the schema's 100 and says there are more" {
+    var registry = try Registry.initComptime(testing.allocator, .{
+        registry_mod.prompt("greet", greetPrompt, .{ .completion = completeManyThings }),
+    });
+    defer registry.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const server: Server = .init(&registry, .{ .name = "s", .version = "1" }, .{});
+    const outcome = try server.handleBytes(.{ .arena = arena.allocator() },
+        \\{"jsonrpc":"2.0","id":1,"method":"completion/complete","params":{
+        \\ "ref":{"type":"ref/prompt","name":"greet"},
+        \\ "argument":{"name":"who","value":""},
+    ++ meta_json ++
+        \\}}
+    );
+    const parsed = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        outcome.reply.bytes,
+        .{},
+    );
+    const completion = parsed.object.get("result").?.object.get("completion").?.object;
+    // 150 candidates, 100 on the wire: the schema's maxItems is a hard 100, and a
+    // handler cannot be expected to know that.
+    try testing.expectEqual(@as(usize, 100), completion.get("values").?.array.items.len);
+    // `total` may exceed what was sent, which is how the client learns the real count.
+    try testing.expectEqual(@as(i64, 150), completion.get("total").?.integer);
+    try testing.expectEqual(true, completion.get("hasMore").?.bool);
+}
+
+test "completion/complete passes the client's already-resolved variables through" {
+    var registry = try Registry.initComptime(testing.allocator, .{
+        registry_mod.ResourceTemplateDefinition{
+            .uri_template = "db://{schema}/{table}",
+            .name = "tables",
+            .handler = readProjectFile,
+            .completion = completeTable,
+        },
+    });
+    defer registry.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const server: Server = .init(&registry, .{ .name = "s", .version = "1" }, .{});
+    const outcome = try server.handleBytes(.{ .arena = arena.allocator() },
+        \\{"jsonrpc":"2.0","id":1,"method":"completion/complete","params":{
+        \\ "ref":{"type":"ref/resource","uri":"db://public/x"},
+        \\ "argument":{"name":"table","value":""},
+        \\ "context":{"arguments":{"schema":"sales"}},
+    ++ meta_json ++
+        \\}}
+    );
+    const parsed = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        outcome.reply.bytes,
+        .{},
+    );
+    const values = parsed.object.get("result").?.object
+        .get("completion").?.object.get("values").?.array.items;
+    // Completing `{table}` is a different answer per schema, so a handler that could
+    // not see `{schema}` would have to answer for all of them or for none.
+    try testing.expectEqual(@as(usize, 1), values.len);
+    try testing.expectEqualStrings("sales.orders", values[0].string);
+}
+
+test "completion/complete without a context tells the handler so" {
+    var registry = try Registry.initComptime(testing.allocator, .{
+        registry_mod.ResourceTemplateDefinition{
+            .uri_template = "db://{schema}/{table}",
+            .name = "tables",
+            .handler = readProjectFile,
+            .completion = completeTable,
+        },
+    });
+    defer registry.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const server: Server = .init(&registry, .{ .name = "s", .version = "1" }, .{});
+    const outcome = try server.handleBytes(.{ .arena = arena.allocator() },
+        \\{"jsonrpc":"2.0","id":1,"method":"completion/complete","params":{
+        \\ "ref":{"type":"ref/resource","uri":"db://public/x"},
+        \\ "argument":{"name":"table","value":""},
+    ++ meta_json ++
+        \\}}
+    );
+    const parsed = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        outcome.reply.bytes,
+        .{},
+    );
+    const values = parsed.object.get("result").?.object
+        .get("completion").?.object.get("values").?.array.items;
+    // `context` is optional, so absent has to be distinguishable from empty rather
+    // than silently reading as some default schema.
+    try testing.expectEqual(@as(usize, 1), values.len);
+    try testing.expectEqualStrings("<no schema>", values[0].string);
+}
+
 test "completion/complete rejects malformed params" {
     var fixture: Fixture = undefined;
     try fixture.init(.{});
@@ -2009,6 +2221,19 @@ test "completion/complete rejects malformed params" {
         // Argument without a name.
         \\{"jsonrpc":"2.0","id":1,"method":"completion/complete","params":{
         \\ "ref":{"type":"ref/prompt","name":"greet"},"argument":{"value":"w"},
+        ++ meta_json ++
+            \\}}
+        ,
+        // Argument without a value. The schema requires it, and reading it as ""
+        // would quietly complete against the empty prefix and return everything.
+        \\{"jsonrpc":"2.0","id":1,"method":"completion/complete","params":{
+        \\ "ref":{"type":"ref/prompt","name":"greet"},"argument":{"name":"who"},
+        ++ meta_json ++
+            \\}}
+        ,
+        // A value of the wrong type, which is the same mistake with a decoy.
+        \\{"jsonrpc":"2.0","id":1,"method":"completion/complete","params":{
+        \\ "ref":{"type":"ref/prompt","name":"greet"},"argument":{"name":"who","value":7},
         ++ meta_json ++
             \\}}
         ,

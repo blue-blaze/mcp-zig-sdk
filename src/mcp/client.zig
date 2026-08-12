@@ -294,6 +294,13 @@ pub const CallOptions = struct {
     extra: ?std.json.ObjectMap = null,
 };
 
+/// One variable of a prompt or URI template that is already filled in, for
+/// `Client.complete` to pass along as `params.context.arguments`.
+pub const ResolvedArgument = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 /// A completed exchange, before the result is interpreted.
 pub const Call = struct {
     /// The id the request went out with.
@@ -606,12 +613,18 @@ pub const Client = struct {
     }
 
     /// Asks for completions for one argument of a prompt or resource template.
+    ///
+    /// `resolved` carries the variables of the same prompt or template the caller has
+    /// already filled in. Pass `&.{}` when there are none — but pass them when there
+    /// are: completing `{table}` in `db://{schema}/{table}` is a different question for
+    /// each schema, and a server given no context can only answer for all of them.
     pub fn complete(
         client: *Client,
         arena: std.mem.Allocator,
         reference: types.CompletionReference,
         argument_name: []const u8,
         partial: []const u8,
+        resolved: []const ResolvedArgument,
         options: CallOptions,
     ) Error!types.CompleteResult {
         var ref: std.json.ObjectMap = .empty;
@@ -633,6 +646,19 @@ pub const Client = struct {
         var params: std.json.ObjectMap = .empty;
         try params.put(arena, "ref", .{ .object = ref });
         try params.put(arena, "argument", .{ .object = argument });
+
+        // Omitted entirely when empty rather than sent as `{}`: `context` is optional,
+        // and an empty object says "I resolved nothing", which is a claim rather than a
+        // silence.
+        if (resolved.len > 0) {
+            var arguments: std.json.ObjectMap = .empty;
+            for (resolved) |entry| {
+                try arguments.put(arena, entry.name, .{ .string = entry.value });
+            }
+            var completion_context: std.json.ObjectMap = .empty;
+            try completion_context.put(arena, "arguments", .{ .object = arguments });
+            try params.put(arena, "context", .{ .object = completion_context });
+        }
 
         return client.request(
             types.CompleteResult,
@@ -1707,6 +1733,7 @@ test "complete decodes suggestions" {
         .{ .prompt = .{ .name = "review" } },
         "language",
         "z",
+        &.{},
         .{},
     );
     try testing.expectEqual(@as(usize, 2), result.completion.values.len);
@@ -1717,6 +1744,30 @@ test "complete decodes suggestions" {
     try testing.expectEqualStrings("ref/prompt", params.get("ref").?.object.get("type").?.string);
     try testing.expectEqualStrings("review", params.get("ref").?.object.get("name").?.string);
     try testing.expectEqualStrings("z", params.get("argument").?.object.get("value").?.string);
+    // Nothing resolved, so no `context` at all — an empty object would be a claim.
+    try testing.expect(params.get("context") == null);
+}
+
+test "resolved variables travel as the completion context" {
+    var fixture: Fixture = undefined;
+    fixture.init(&.{
+        \\{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete",
+        \\ "completion":{"values":["sales.orders"]}}}
+    }, .{});
+    defer fixture.deinit();
+
+    _ = try fixture.client.complete(
+        fixture.allocator(),
+        .{ .resource = .{ .uri = "db://{schema}/{table}" } },
+        "table",
+        "or",
+        &.{.{ .name = "schema", .value = "sales" }},
+        .{},
+    );
+
+    const params = (try fixture.lastSent()).get("params").?.object;
+    const arguments = params.get("context").?.object.get("arguments").?.object;
+    try testing.expectEqualStrings("sales", arguments.get("schema").?.string);
 }
 
 test "a resource template reference is encoded with its uri" {
@@ -1732,6 +1783,7 @@ test "a resource template reference is encoded with its uri" {
         .{ .resource = .{ .uri = "file:///project/{path}" } },
         "path",
         "src/",
+        &.{},
         .{},
     );
 

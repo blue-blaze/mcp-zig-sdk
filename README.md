@@ -119,6 +119,13 @@ Credentials are checked before the body is parsed, so a client with no token get
 about its JSON. The per-tool requirement is then applied to the grant already
 established, which is why widening a scope never revalidates a token.
 
+`completion/complete` inherits the scopes of whatever its `params.ref` names. It has to:
+completing an argument of a privileged prompt runs that prompt's completion handler, which
+is the code that enumerates the values the scope exists to protect. It names its subject in
+the body rather than in `Mcp-Name`, so the lookup is `params.ref`'s — and it is the same
+lookup dispatch will perform, because authorizing one entity and completing another is the
+failure this shares one code path to avoid.
+
 On the client side a refusal surfaces as `error.Unauthorized`, and the transport records
 what the server said:
 

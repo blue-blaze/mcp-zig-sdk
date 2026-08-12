@@ -125,6 +125,25 @@ const completion = await client.complete({
 });
 check('completion/complete', Array.isArray(completion.completion?.values), completion.completion?.values?.join(', '));
 
+// The same argument, completed with and without a resolved sibling. `memory safety` is
+// only worth suggesting once the language is known, so the pair proves the server read
+// `params.context.arguments` rather than that it happened to return everything.
+const focusWithLanguage = await client.complete({
+    ref: { type: 'ref/prompt', name: 'review_code' },
+    argument: { name: 'focus', value: '' },
+    context: { arguments: { language: 'zig' } },
+});
+const focusAlone = await client.complete({
+    ref: { type: 'ref/prompt', name: 'review_code' },
+    argument: { name: 'focus', value: '' },
+});
+check(
+    'completion/complete reads context.arguments',
+    focusWithLanguage.completion?.values?.includes('memory safety') &&
+        !focusAlone.completion?.values?.includes('memory safety'),
+    `with=${focusWithLanguage.completion?.values?.join(', ')} without=${focusAlone.completion?.values?.join(', ')}`,
+);
+
 await client.close();
 
 const failures = checks.filter((c) => !c.ok);

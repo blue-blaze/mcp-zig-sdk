@@ -78,6 +78,7 @@ fn emitServerReplies(gpa: std.mem.Allocator, out: *std.Io.Writer) !void {
             .annotations = .{ .readOnlyHint = true },
         }),
         registry.prompt("greet", greet, .{ .completion = completeWho }),
+        registry.prompt("pick_city", greet, .{ .completion = completeManyCities }),
         registry.ResourceDefinition{
             .uri = "file:///readme.md",
             .name = "readme.md",
@@ -179,6 +180,16 @@ fn emitServerReplies(gpa: std.mem.Allocator, out: *std.Io.Writer) !void {
             .request = "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"completion/complete\"," ++
                 "\"params\":{\"ref\":{\"type\":\"ref/prompt\",\"name\":\"greet\"}," ++
                 "\"argument\":{\"name\":\"who\",\"value\":\"wor\"}," ++ request_meta ++ "}}",
+        },
+        .{
+            // The same result from a handler with 150 candidates. `maxItems: 100` on
+            // `completion.values` is in the schema, so validating a real reply is what
+            // would catch the cap being lost — a unit test asserting 100 could be
+            // changed to assert 150 and still look deliberate.
+            .def = "CompleteResultResponse",
+            .request = "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"completion/complete\"," ++
+                "\"params\":{\"ref\":{\"type\":\"ref/prompt\",\"name\":\"pick_city\"}," ++
+                "\"argument\":{\"name\":\"who\",\"value\":\"\"}," ++ request_meta ++ "}}",
         },
         // Error paths, which have their own definitions in the schema.
         .{
@@ -696,6 +707,20 @@ fn completeWho(
         }
     }
     return matches.items;
+}
+
+/// More candidates than the wire allows, so the emitted reply exercises the
+/// dispatcher's cap rather than the handler's restraint.
+fn completeManyCities(
+    context: *mcp.Context,
+    _: []const u8,
+    _: []const u8,
+) mcp.Error![]const []const u8 {
+    const values = try context.arena.alloc([]const u8, 150);
+    for (values, 0..) |*slot, index| {
+        slot.* = try context.print("city-{d}", .{index});
+    }
+    return values;
 }
 
 /// Writes one record per sample. `def` names the schema definition the payload is

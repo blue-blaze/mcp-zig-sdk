@@ -134,6 +134,16 @@ fn reviewPrompt(context: *mcp.Context, args: ReviewArgs) mcp.Error!mcp.types.Get
 }
 
 /// Completions for the review prompt's arguments.
+/// What is worth reviewing in a given language, or the language-agnostic answers when
+/// the client has not resolved `language` yet.
+fn focusFor(language: ?[]const u8) []const []const u8 {
+    const name = language orelse return &.{ "error handling", "readability" };
+    if (std.mem.eql(u8, name, "zig") or std.mem.eql(u8, name, "rust")) {
+        return &.{ "memory safety", "error handling", "readability" };
+    }
+    return &.{ "error handling", "readability" };
+}
+
 fn completeReview(
     context: *mcp.Context,
     argument_name: []const u8,
@@ -142,7 +152,10 @@ fn completeReview(
     const candidates: []const []const u8 = if (std.mem.eql(u8, argument_name, "language"))
         &.{ "zig", "rust", "python", "typescript" }
     else if (std.mem.eql(u8, argument_name, "focus"))
-        &.{ "memory safety", "error handling", "readability" }
+        // The client tells us which language it already chose, and what is worth
+        // reviewing differs by language. Without `params.context.arguments` this could
+        // only ever offer the union of every language's answer.
+        focusFor(context.resolvedArgument("language"))
     else
         &.{};
 

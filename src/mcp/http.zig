@@ -1077,6 +1077,18 @@ fn readDoc(context: *Context, uri: []const u8) Error!types.ReadResourceResult {
     return .{ .contents = contents };
 }
 
+fn secretPrompt(context: *Context, _: struct {}) Error!types.GetPromptResult {
+    const messages = try context.arena.alloc(types.PromptMessage, 1);
+    messages[0] = .{ .role = .user, .content = types.ContentBlock.fromText("secret") };
+    return .{ .messages = messages };
+}
+
+/// The reason completing a privileged prompt needs that prompt's scopes: this is the
+/// code the scope protects, and it runs before the handler ever does.
+fn completeSecret(_: *Context, _: []const u8, _: []const u8) Error![]const []const u8 {
+    return &.{ "classified-alpha", "classified-beta" };
+}
+
 const Fixture = struct {
     registry: registry_mod.Registry,
     server: Server,
@@ -1090,6 +1102,10 @@ const Fixture = struct {
             registry_mod.tool("with_retries", withRetries, .{}),
             registry_mod.tool("plain", plainTool, .{}),
             registry_mod.tool("privileged", plainTool, .{ .scopes = "files:write" }),
+            registry_mod.prompt("privileged_prompt", secretPrompt, .{
+                .scopes = "files:write",
+                .completion = completeSecret,
+            }),
             registry_mod.ResourceDefinition{
                 .uri = "file:///doc.md",
                 .name = "doc.md",
@@ -1298,6 +1314,49 @@ test "a tool whose scopes the grant holds runs" {
 
     try testing.expect(outcome == .json);
     try testing.expectEqual(@as(u16, 200), outcome.json.status);
+}
+
+test "completing a privileged prompt's argument needs that prompt's scopes" {
+    var protected: Protected = undefined;
+    try protected.init("mcp:use");
+    defer protected.deinit();
+
+    // `completion/complete` names its subject in `params.ref`, not in `Mcp-Name`, so
+    // this used to slip past with the baseline alone — and the completion handler is
+    // exactly the code that enumerates what the scope is protecting.
+    const outcome = try protected.fixture.post(&.{
+        version_pair,
+        .{ header.method, types.method.completion_complete },
+        auth_pair,
+    }, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"completion/complete\",\"params\":{" ++
+        meta ++ ",\"ref\":{\"type\":\"ref/prompt\",\"name\":\"privileged_prompt\"}," ++
+        "\"argument\":{\"name\":\"topic\",\"value\":\"cl\"}}}");
+
+    try testing.expect(outcome == .unauthorized);
+    try testing.expectEqual(@as(u16, 403), outcome.unauthorized.status);
+    try testing.expect(std.mem.indexOf(u8, outcome.unauthorized.challenge.?, "files:write") != null);
+    // A `.unauthorized` outcome carries no body, so the refusal being this variant is
+    // itself the assertion that no candidate value was produced. The companion test
+    // below shows the same request returning them once the scope is held, which is what
+    // makes this one mean something.
+}
+
+test "completing a privileged prompt's argument works with the scopes held" {
+    var protected: Protected = undefined;
+    try protected.init("mcp:use files:write");
+    defer protected.deinit();
+
+    const outcome = try protected.fixture.post(&.{
+        version_pair,
+        .{ header.method, types.method.completion_complete },
+        auth_pair,
+    }, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"completion/complete\",\"params\":{" ++
+        meta ++ ",\"ref\":{\"type\":\"ref/prompt\",\"name\":\"privileged_prompt\"}," ++
+        "\"argument\":{\"name\":\"topic\",\"value\":\"cl\"}}}");
+
+    try testing.expect(outcome == .json);
+    try testing.expectEqual(@as(u16, 200), outcome.json.status);
+    try testing.expect(std.mem.indexOf(u8, outcome.json.bytes, "classified-alpha") != null);
 }
 
 test "a tool declaring no scopes needs only the baseline" {
