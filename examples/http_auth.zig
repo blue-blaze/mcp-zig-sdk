@@ -311,6 +311,35 @@ const McpThread = struct {
 // The client
 // ---------------------------------------------------------------------------
 
+/// The token in force, asked for once per request rather than fixed at construction.
+///
+/// This is the shape a real client wants: the credential outlives any one exchange and is
+/// replaced under it — here by the step-up in stage 5, in production by a refresh an hour
+/// in. Baking the header into `Options.extra_headers` would mean rebuilding the transport
+/// every time the token changed, and getting the lifetime of the old value right while
+/// doing it.
+const Credential = struct {
+    /// Null before anything has been obtained, which is stage 1.
+    authorization: ?[]const u8 = null,
+
+    fn source(self: *Credential) mcp.http_client.HeaderSource {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: mcp.http_client.HeaderSource.VTable = .{ .headers = headers };
+
+    fn headers(
+        ptr: *anyopaque,
+        arena: std.mem.Allocator,
+    ) error{OutOfMemory}![]const mcp.http_client.Header {
+        const self: *Credential = @ptrCast(@alignCast(ptr));
+        const value = self.authorization orelse return &.{};
+        const list = try arena.alloc(mcp.http_client.Header, 1);
+        list[0] = .{ .name = "Authorization", .value = value };
+        return list;
+    }
+};
+
 /// One `tools/list`, reporting whether it was refused.
 const Attempt = union(enum) {
     ok: usize,
@@ -321,17 +350,10 @@ fn listTools(
     gpa: std.mem.Allocator,
     io: std.Io,
     arena: std.mem.Allocator,
-    authorization: ?[]const u8,
+    credential: *Credential,
 ) !Attempt {
-    var headers: [1][2][]const u8 = undefined;
-    var count: usize = 0;
-    if (authorization) |value| {
-        headers[0] = .{ "Authorization", value };
-        count = 1;
-    }
-
     var transport: mcp.http_client.Transport = .init(gpa, io, resource, .{
-        .extra_headers = headers[0..count],
+        .header_source = credential.source(),
     });
     defer transport.deinit();
 
@@ -359,12 +381,10 @@ fn appendNoteCall(
     gpa: std.mem.Allocator,
     io: std.Io,
     arena: std.mem.Allocator,
-    authorization: []const u8,
+    credential: *Credential,
 ) !CallAttempt {
-    const headers = [_][2][]const u8{.{ "Authorization", authorization }};
-
     var transport: mcp.http_client.Transport = .init(gpa, io, resource, .{
-        .extra_headers = &headers,
+        .header_source = credential.source(),
     });
     defer transport.deinit();
 
@@ -414,9 +434,13 @@ pub fn main(init: std.process.Init) !void {
     var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     const out = &stdout.interface;
 
+    // One credential for the whole flow. Stage 5 replaces what it holds; nothing is
+    // rebuilt around it.
+    var credential: Credential = .{};
+
     // ---- 1. no credentials ----
     try out.writeAll("1. tools/list with no token\n");
-    const anonymous = try listTools(gpa, io, arena, null);
+    const anonymous = try listTools(gpa, io, arena, &credential);
     const first_challenge = switch (anonymous) {
         .ok => return error.ExpectedRefusal,
         .refused => |challenge| challenge,
@@ -466,8 +490,8 @@ pub fn main(init: std.process.Init) !void {
 
     // ---- 3. the same request, with the token ----
     try out.writeAll("\n3. tools/list with the token\n");
-    const header = try tokens.authorizationHeader(arena);
-    switch (try listTools(gpa, io, arena, header)) {
+    credential.authorization = try tokens.authorizationHeader(arena);
+    switch (try listTools(gpa, io, arena, &credential)) {
         .ok => |n| try out.print("   {d} tools\n", .{n}),
         .refused => |challenge| {
             try out.print("   UNEXPECTED {d} {s}\n", .{ challenge.status, challenge.header.? });
@@ -479,7 +503,7 @@ pub fn main(init: std.process.Init) !void {
 
     // ---- 4. a tool the token does not cover ----
     try out.writeAll("\n4. tools/call on a tool that declares a scope\n");
-    const forbidden = switch (try appendNoteCall(gpa, io, arena, header)) {
+    const forbidden = switch (try appendNoteCall(gpa, io, arena, &credential)) {
         .ok => return error.ExpectedRefusal,
         .refused => |challenge| challenge,
     };
@@ -516,8 +540,9 @@ pub fn main(init: std.process.Init) !void {
     );
     try out.print("   granted:    {s}\n", .{wider.scopes});
 
-    const wider_header = try wider.authorizationHeader(arena);
-    switch (try appendNoteCall(gpa, io, arena, wider_header)) {
+    // The rotation itself: one assignment, and the next request carries the new token.
+    credential.authorization = try wider.authorizationHeader(arena);
+    switch (try appendNoteCall(gpa, io, arena, &credential)) {
         .ok => |text| try out.print("   tool said: {s}\n", .{text}),
         .refused => |challenge| {
             try out.print("   UNEXPECTED {d} {s}\n", .{ challenge.status, challenge.header.? });

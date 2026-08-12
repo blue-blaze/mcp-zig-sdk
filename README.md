@@ -143,9 +143,26 @@ client.listTools(arena, .{}) catch |err| switch (err) {
 };
 ```
 
-`zig build run-http-auth` runs all of it against real sockets: a mock authorization
-server, a protected MCP server, and a client that starts with nothing and works its way
-through a `401` and a `403`.
+A token outlives no client for long — an hour is typical — so the header it goes in is
+asked for per request rather than fixed when the transport is built:
+
+```zig
+var transport: mcp.http_client.Transport = .init(gpa, io, url, .{
+    .header_source = credential.source(),   // consulted once per `send`
+});
+...
+credential.authorization = try refreshed.authorizationHeader(arena);   // next request uses it
+```
+
+`Options.extra_headers` is still there for headers that genuinely do not change, and takes
+a named `Header{ .name, .value }` rather than a `[2][]const u8` whose two strings look
+alike at the call site. Rewriting `extra_headers` in place also works, but only under
+conditions the type cannot state — the storage must outlive the transport, the write must
+land between exchanges, and no other thread may be reading it — which is why the rotating
+case has its own mechanism. `zig build run-http-auth` runs all of it against real sockets:
+a mock authorization server, a protected MCP server, and a client that starts with nothing
+and works its way through a `401` and a `403`, replacing what one `Credential` holds
+instead of rebuilding a transport per attempt.
 
 stdio is deliberately **not** covered. The specification says a stdio server SHOULD NOT
 use OAuth — the client started the process and can pass credentials directly — and

@@ -209,9 +209,73 @@ pub const ParamHeaders = struct {
 // Transport
 // ---------------------------------------------------------------------------
 
+/// One request header, named rather than positional.
+///
+/// `[2][]const u8` was the earlier spelling, and `.{ "Authorization", token }` reads fine
+/// in a test and badly in application code — nothing at the call site says which of the
+/// two strings is the name.
+pub const Header = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// Supplies headers whose value is not known when the transport is built.
+///
+/// A bearer token expires — an hour is typical — so a client that lives longer than its
+/// credential needs the header to change without the transport being rebuilt. Rewriting
+/// `Options.extra_headers` in place works, but only under conditions the type cannot
+/// state: the backing array has to outlive the transport, the rewrite has to land between
+/// a `receive` returning null and the next `send`, and nothing may be reading it
+/// concurrently. Asking at the moment the request is built has none of those conditions.
+///
+/// ```zig
+/// const Credential = struct {
+///     token: []const u8,
+///
+///     fn headers(ptr: *anyopaque, arena: std.mem.Allocator) error{OutOfMemory}![]const Header {
+///         const self: *Credential = @ptrCast(@alignCast(ptr));
+///         const list = try arena.alloc(Header, 1);
+///         list[0] = .{ .name = "Authorization", .value = self.token };
+///         return list;
+///     }
+///
+///     const vtable: HeaderSource.VTable = .{ .headers = headers };
+/// };
+/// ```
+pub const HeaderSource = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// The headers to add to the request about to be sent.
+        ///
+        /// `arena` lives until the reply has been read, so a value computed here may be
+        /// allocated from it; a value borrowed from the implementation's own storage is
+        /// equally fine as long as that storage outlives the exchange. Called once per
+        /// `send`, before the connection is opened — so refreshing a token from here is
+        /// allowed, and is the point.
+        headers: *const fn (
+            ptr: *anyopaque,
+            arena: std.mem.Allocator,
+        ) error{OutOfMemory}![]const Header,
+    };
+
+    fn get(self: HeaderSource, arena: std.mem.Allocator) error{OutOfMemory}![]const Header {
+        return self.vtable.headers(self.ptr, arena);
+    }
+};
+
 pub const Options = struct {
-    /// Headers added to every request. `Authorization` goes here.
-    extra_headers: []const [2][]const u8 = &.{},
+    /// Headers added to every request, fixed for the transport's lifetime.
+    ///
+    /// For anything that changes while the transport is alive — a bearer token, most
+    /// obviously — use `header_source` instead. This slice is read inside `send`, so
+    /// mutating it from another thread is a race, and mutating it between calls only
+    /// works if the storage outlives the transport.
+    extra_headers: []const Header = &.{},
+    /// Headers asked for per request. Appended after `extra_headers`, so a name appearing
+    /// in both is sent twice — put a rotating credential in one place, not both.
+    header_source: ?HeaderSource = null,
     /// Bound on a single JSON response body, and on one SSE event.
     response_bytes_max: usize = jsonrpc.message_size_max,
     /// How long to wait for the next bytes of a response before giving up, in
@@ -473,11 +537,14 @@ pub const Transport = struct {
         self: *const Transport,
         arena: std.mem.Allocator,
         message: []const u8,
-    ) Error![]const [2][]const u8 {
-        var list: std.ArrayListUnmanaged([2][]const u8) = .empty;
-        try list.append(arena, .{ http.header.content_type, "application/json" });
-        try list.append(arena, .{ http.header.accept, accept_value });
-        for (self.options.extra_headers) |pair| try list.append(arena, pair);
+    ) Error![]const Header {
+        var list: std.ArrayListUnmanaged(Header) = .empty;
+        try list.append(arena, .{ .name = http.header.content_type, .value = "application/json" });
+        try list.append(arena, .{ .name = http.header.accept, .value = accept_value });
+        for (self.options.extra_headers) |entry| try list.append(arena, entry);
+        if (self.options.header_source) |source| {
+            for (try source.get(arena)) |entry| try list.append(arena, entry);
+        }
 
         // A body that does not parse still gets posted: the server's answer to a
         // malformed message is more useful than a local guess, and it is the server's
@@ -489,21 +556,21 @@ pub const Transport = struct {
             // version, which the server needs either way.
             else => {
                 if (versionOf(parsed)) |version| {
-                    try list.append(arena, .{ http.header.protocol_version, version });
+                    try list.append(arena, .{ .name = http.header.protocol_version, .value = version });
                 }
                 return list.items;
             },
         };
 
         if (http.bodyProtocolVersion(rpc.params)) |version| {
-            try list.append(arena, .{ http.header.protocol_version, version });
+            try list.append(arena, .{ .name = http.header.protocol_version, .value = version });
         }
-        try list.append(arena, .{ http.header.method, rpc.method });
+        try list.append(arena, .{ .name = http.header.method, .value = rpc.method });
 
         if (http.subjectOf(rpc)) |subject| {
             try list.append(arena, .{
-                http.header.name,
-                try http.encodeHeaderValue(arena, subject),
+                .name = http.header.name,
+                .value = try http.encodeHeaderValue(arena, subject),
             });
         }
         try self.appendParamHeaders(arena, &list, rpc);
@@ -514,7 +581,7 @@ pub const Transport = struct {
     fn appendParamHeaders(
         self: *const Transport,
         arena: std.mem.Allocator,
-        list: *std.ArrayListUnmanaged([2][]const u8),
+        list: *std.ArrayListUnmanaged(Header),
         rpc: jsonrpc.Request,
     ) Error!void {
         const known = self.options.param_headers orelse return;
@@ -534,7 +601,10 @@ pub const Transport = struct {
                 "{s}{s}",
                 .{ http.header.param_prefix, mapping.header },
             );
-            try list.append(arena, .{ name, try http.encodeHeaderValue(arena, rendered) });
+            try list.append(arena, .{
+                .name = name,
+                .value = try http.encodeHeaderValue(arena, rendered),
+            });
         }
     }
 };
@@ -695,7 +765,7 @@ const Exchange = struct {
     fn writeRequest(
         exchange: *Exchange,
         body: []const u8,
-        headers: []const [2][]const u8,
+        headers: []const Header,
     ) Error!void {
         const writer = exchange.socketWriter();
 
@@ -707,8 +777,8 @@ const Exchange = struct {
         // stream occupies its connection for as long as it lives, so a pool would have
         // to model that; the simple thing is correct and the cost is local.
         writer.writeAll("Connection: close\r\n") catch return error.ConnectionFailed;
-        for (headers) |pair| {
-            writer.print("{s}: {s}\r\n", .{ pair[0], pair[1] }) catch
+        for (headers) |entry| {
+            writer.print("{s}: {s}\r\n", .{ entry.name, entry.value }) catch
                 return error.ConnectionFailed;
         }
         writer.print("Content-Length: {d}\r\n\r\n", .{body.len}) catch
@@ -1412,14 +1482,14 @@ test "parseStatus reads the code and rejects a non-HTTP head" {
 }
 
 /// Builds the headers a message would be sent with, without opening a connection.
-fn headersOf(arena: std.mem.Allocator, message: []const u8, options: Options) ![]const [2][]const u8 {
+fn headersOf(arena: std.mem.Allocator, message: []const u8, options: Options) ![]const Header {
     var transport: Transport = .init(testing.allocator, undefined, "http://localhost/mcp", options);
     return transport.headersFor(arena, message);
 }
 
-fn headerValue(headers: []const [2][]const u8, name: []const u8) ?[]const u8 {
-    for (headers) |pair| {
-        if (std.ascii.eqlIgnoreCase(pair[0], name)) return pair[1];
+fn headerValue(headers: []const Header, name: []const u8) ?[]const u8 {
+    for (headers) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.name, name)) return entry.value;
     }
     return null;
 }
@@ -1657,9 +1727,72 @@ test "extra headers are sent, which is how a token reaches the server" {
         arena.allocator(),
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{" ++
             request_meta ++ "}}",
-        .{ .extra_headers = &.{.{ "Authorization", "Bearer t0ken" }} },
+        .{ .extra_headers = &.{.{ .name = "Authorization", .value = "Bearer t0ken" }} },
     );
     try testing.expectEqualStrings("Bearer t0ken", headerValue(headers, "Authorization").?);
+}
+
+/// A credential that is replaced under the transport, which is what a bearer token does.
+const RotatingCredential = struct {
+    token: []const u8,
+    asked: usize = 0,
+
+    fn source(self: *RotatingCredential) HeaderSource {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: HeaderSource.VTable = .{ .headers = headers };
+
+    fn headers(ptr: *anyopaque, arena: std.mem.Allocator) error{OutOfMemory}![]const Header {
+        const self: *RotatingCredential = @ptrCast(@alignCast(ptr));
+        self.asked += 1;
+        const list = try arena.alloc(Header, 1);
+        list[0] = .{ .name = "Authorization", .value = self.token };
+        return list;
+    }
+};
+
+test "a header source is asked per request, so a rotated token is the one sent" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    var credential: RotatingCredential = .{ .token = "Bearer first" };
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{" ++
+        request_meta ++ "}}";
+    const options: Options = .{ .header_source = credential.source() };
+
+    const before = try headersOf(arena.allocator(), body, options);
+    try testing.expectEqualStrings("Bearer first", headerValue(before, "Authorization").?);
+
+    // The whole point: nothing is rebuilt, and the next request carries the new value.
+    credential.token = "Bearer second";
+    const after = try headersOf(arena.allocator(), body, options);
+    try testing.expectEqualStrings("Bearer second", headerValue(after, "Authorization").?);
+    try testing.expectEqual(@as(usize, 2), credential.asked);
+}
+
+test "a header source returning nothing adds nothing" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    // The pre-credential state a client starts in. It has to be expressible, or the
+    // first request — the one that earns the 401 that says how to authorize — cannot be
+    // made through the same transport as the rest.
+    const Empty = struct {
+        fn headers(_: *anyopaque, _: std.mem.Allocator) error{OutOfMemory}![]const Header {
+            return &.{};
+        }
+        const vtable: HeaderSource.VTable = .{ .headers = headers };
+    };
+    var nothing: u8 = 0;
+
+    const headers = try headersOf(
+        arena.allocator(),
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{" ++
+            request_meta ++ "}}",
+        .{ .header_source = .{ .ptr = &nothing, .vtable = &Empty.vtable } },
+    );
+    try testing.expect(headerValue(headers, "Authorization") == null);
 }
 
 test "renderHeaderValue covers the scalars and refuses the rest" {
