@@ -83,7 +83,14 @@ pub const Transport = struct {
     /// such a transport, deliberately: the specification says a stdio server SHOULD NOT
     /// use OAuth, because the client started the process and can hand it credentials
     /// directly.
-    pub const SendError = error{ TransportFailed, MessageTooLarge, Unauthorized, OutOfMemory };
+    ///
+    /// `Timeout` here is not the same news as `Timeout` from `receive`, and the
+    /// difference decides whether retrying is safe. On Streamable HTTP `send` posts the
+    /// body *and* reads the response head, so a deadline that expires during it means
+    /// the request was delivered and the server has not answered yet — it may well have
+    /// run the tool. Re-sending is a second execution, not a retry. `receive` expiring
+    /// says only that the answer is late.
+    pub const SendError = error{ TransportFailed, MessageTooLarge, Unauthorized, Timeout, OutOfMemory };
 
     /// `Timeout` is how a transport says "the peer has gone quiet" as opposed to "the
     /// peer is gone". A transport with no deadline never returns it, and a caller that
@@ -334,6 +341,18 @@ pub const Options = struct {
     /// A server streaming progress is normal; a server streaming forever is not, and
     /// without a bound a client would wait for it indefinitely.
     messages_max: usize = 4096,
+    // There is deliberately no timeout field here, and its absence is the one thing in
+    // this struct worth explaining. A deadline needs two things a `Client` does not
+    // have: an `Io` to wait on and a clock to measure with. It holds neither, which is
+    // what lets the same client drive a socket, a pipe, or an in-memory pair in a test.
+    // Adding `timeout_ms` here would mean either smuggling an `Io` in beside it or
+    // handing the number to the transport to enforce — and the second is just the
+    // transport's own option with an extra hop.
+    //
+    // So the knob lives on whichever transport owns the wait:
+    // `http_client.Options.receive_timeout_ms` bounds a Streamable HTTP read. Expiry
+    // arrives here as `error.Timeout`, and `Transport`'s documentation states why
+    // abandoning the call it belonged to is safe.
     /// Where this client explains itself when it refuses something.
     ///
     /// Every error returned from here is one of a dozen names, and a name cannot say
@@ -1253,6 +1272,7 @@ fn mapSendError(err: Transport.SendError) Error {
         error.TransportFailed => error.TransportFailed,
         error.MessageTooLarge => error.MessageTooLarge,
         error.Unauthorized => error.Unauthorized,
+        error.Timeout => error.Timeout,
         error.OutOfMemory => error.OutOfMemory,
     };
 }

@@ -141,6 +141,37 @@ A server built with `mount` on its own Velo app has to set `write_ms = 0` itself
 doc comment on `mount` says so, because the failure is a stream that works perfectly for
 thirty seconds and then closes with no reply.
 
+## Bounding a hung server
+
+The mirror image, on the client: a server that accepts the POST and then says nothing.
+`http_client.Options.receive_timeout_ms` bounds the wait and surfaces expiry as
+`error.Timeout`.
+
+```zig
+var transport: mcp.http_client.Transport = .init(gpa, io, url, .{
+    .receive_timeout_ms = 30_000,
+});
+```
+
+It is a gap between bytes rather than a deadline on the exchange, which is what lets a
+`subscriptions/listen` stream — a response that never ends — live under it. Abandoning the
+call it belonged to is safe: request ids are never reused and `receive` skips any response
+whose id it is not awaiting, so a late reply is discarded rather than mistaken for the
+next one. That is a documented guarantee, and a caller building its own deadline with
+`io.async` may rely on it.
+
+There is deliberately no equivalent on `Client.Options`. A deadline needs an `Io` to wait
+on and a clock to measure with, and `Client` holds neither — which is what lets the same
+client drive a socket, a pipe, or an in-memory pair in a test. The knob belongs to
+whichever transport owns the wait.
+
+Two gaps stated rather than left to be found: it is not enforced on `https`, where the
+socket belongs to Velo's TLS session and the read happens inside OpenSSL (the transport
+writes a diagnostic when both are configured), and it does not cover connecting, since
+`std.Io.net` exposes no deadline there. `SO_RCVTIMEO` is not the missing piece — on a
+blocking socket it fails a read with `EAGAIN`, which `std.Io.Threaded` treats as a caller
+bug and aborts on, so the socket option would turn a slow server into a crash.
+
 ## Memory
 
 Request memory is an arena the transport owns. A handler allocates from
@@ -174,6 +205,12 @@ Three consequences worth knowing before they are discovered:
 - Notifications are encoded into the request arena and are not freed until the request
   ends, so a handler that reports progress per row accumulates every one of those messages.
   Report per batch.
+
+On the client side of Streamable HTTP the bound on a response is applied while it
+arrives, not after. Only a declared `Content-Length` can be refused up front; a
+`Transfer-Encoding: chunked` body and a `Connection: close` body with no length have
+nothing to check, and those two were bounded by nothing but the server's willingness to
+stop. The number of lines in a response head is bounded for the same reason.
 
 Request bodies over HTTP are bounded by what Velo can buffer rather than by the protocol's
 16 MiB ceiling, and the effective limit is lower still — the body and its parsed form share

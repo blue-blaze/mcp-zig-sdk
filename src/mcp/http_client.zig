@@ -61,6 +61,9 @@ pub const Error = error{
     /// The server refused on authorization grounds. `Transport.challenge` holds what
     /// it said.
     Unauthorized,
+    /// `Options.receive_timeout_ms` expired with the response unfinished. The
+    /// connection is dropped, but the request may already have been carried out.
+    Timeout,
     OutOfMemory,
 };
 
@@ -211,6 +214,30 @@ pub const Options = struct {
     extra_headers: []const [2][]const u8 = &.{},
     /// Bound on a single JSON response body, and on one SSE event.
     response_bytes_max: usize = jsonrpc.message_size_max,
+    /// How long to wait for the next bytes of a response before giving up, in
+    /// milliseconds. Null waits forever, which is the previous behaviour and the
+    /// default.
+    ///
+    /// This is the only place a hung server can be noticed. `Client` holds no `Io` and
+    /// no clock — that is what lets it drive a pipe or an in-memory pair as readily as a
+    /// socket — so the transport that owns the socket is the layer that can bound the
+    /// wait. Expiry surfaces as `error.Timeout` all the way up, and abandoning the call
+    /// is safe for the reason `client.Transport` documents: ids are never reused, so a
+    /// late reply is discarded rather than mistaken for the next one.
+    ///
+    /// It is a gap between bytes, not a bound on the whole exchange, and that is the
+    /// point: a `subscriptions/listen` stream is a response that never ends, and a total
+    /// deadline would kill it. A server that keeps talking keeps the connection.
+    ///
+    /// Two limits worth knowing before choosing a value:
+    ///
+    /// * **`https` is not covered.** Under TLS the socket belongs to Velo's session and
+    ///   the read happens inside OpenSSL, which this transport cannot interpose on. The
+    ///   option is accepted and has no effect there; a diagnostic says so when such an
+    ///   exchange opens, rather than leaving it to be discovered.
+    /// * **Connecting is not covered.** `std.Io.net` exposes no deadline on connect, so
+    ///   an unroutable address still waits for the operating system's own bound.
+    receive_timeout_ms: ?u32 = null,
     /// Skip TLS certificate and hostname verification. Insecure; for a self-signed
     /// certificate in a test, never for real traffic.
     tls_insecure: bool = false,
@@ -329,6 +356,7 @@ pub const Transport = struct {
             error.OutOfMemory => error.OutOfMemory,
             error.MessageTooLarge => error.MessageTooLarge,
             error.Unauthorized => error.Unauthorized,
+            error.Timeout => error.Timeout,
             else => {
                 self.report("send failed: {t}\n", .{err});
                 return error.TransportFailed;
@@ -344,6 +372,7 @@ pub const Transport = struct {
         return self.receive(arena) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.MessageTooLarge => error.MessageTooLarge,
+            error.Timeout => error.Timeout,
             else => {
                 self.report("receive failed: {t}\n", .{err});
                 return error.TransportFailed;
@@ -367,8 +396,16 @@ pub const Transport = struct {
 
         const headers = try self.headersFor(arena, message);
 
-        const exchange = try Exchange.open(self.gpa, self.io, self.url, self.options.tls_insecure);
+        const exchange = try Exchange.open(self.gpa, self.io, self.url, self.options);
         errdefer exchange.close(self.io);
+        if (self.options.receive_timeout_ms != null and exchange.tls != null) {
+            // Said out loud rather than left to be discovered: a deadline that is
+            // configured and not enforced is worse than one that was never asked for.
+            self.report(
+                "receive_timeout_ms is not enforced on https; the TLS session owns the socket\n",
+                .{},
+            );
+        }
 
         try exchange.writeRequest(message, headers);
         try exchange.readHead(arena, self.options.response_bytes_max);
@@ -406,6 +443,15 @@ pub const Transport = struct {
             self.finish();
             return err;
         };
+        // Asked before the message is looked at, because a read that stopped at the
+        // deadline leaves a *plausible* result behind rather than an error: a truncated
+        // length-delimited body comes back as whatever arrived, and a cut SSE stream comes
+        // back as null, which otherwise reads as "the server is done". Either one would
+        // hand the client a lie about a request that is still outstanding.
+        if (exchange.timedOut()) {
+            self.finish();
+            return error.Timeout;
+        }
         if (message == null) self.finish();
         return message;
     }
@@ -544,18 +590,37 @@ const Exchange = struct {
 
     read_buffer: []u8,
     write_buffer: []u8,
-    reader: std.Io.net.Stream.Reader,
+    reader: SocketReader,
     writer: std.Io.net.Stream.Writer,
     tls: ?TlsSession = null,
 
     /// The response being read. Filled in by `readHead`.
     response: Response = undefined,
 
+    /// Whichever reader is reading the socket.
+    ///
+    /// Two of them because the deadline is optional and the plain reader is the one
+    /// `std.Io.net` already provides. A configured deadline substitutes `TimedReader`
+    /// rather than layering on top, so a client that sets no deadline reads through
+    /// exactly the code it read through before — no new failure mode on a platform where
+    /// concurrent waiting is unavailable.
+    const SocketReader = union(enum) {
+        plain: std.Io.net.Stream.Reader,
+        timed: TimedReader,
+
+        fn interface(self: *SocketReader) *std.Io.Reader {
+            return switch (self.*) {
+                .plain => |*plain| &plain.interface,
+                .timed => |*timed| &timed.interface,
+            };
+        }
+    };
+
     fn open(
         gpa: std.mem.Allocator,
         io: std.Io,
         url: []const u8,
-        tls_insecure: bool,
+        options: Options,
     ) Error!*Exchange {
         const target = try parseUrl(url);
 
@@ -570,6 +635,11 @@ const Exchange = struct {
         const stream = connect(io, target.host, target.port) catch return error.ConnectionFailed;
         errdefer stream.close(io);
 
+        // Under TLS the bytes are read by OpenSSL from a handle Velo owns, so there is
+        // nothing here to bound; substituting a reader would only bound the TLS record
+        // layer's own framing, which is not where a hung server is waited on.
+        const deadline: ?u32 = if (target.tls) null else options.receive_timeout_ms;
+
         exchange.* = .{
             .gpa = gpa,
             .io = io,
@@ -577,12 +647,15 @@ const Exchange = struct {
             .target = target,
             .read_buffer = read_buffer,
             .write_buffer = write_buffer,
-            .reader = stream.reader(io, read_buffer),
+            .reader = if (deadline) |ms|
+                .{ .timed = .init(io, stream, read_buffer, ms) }
+            else
+                .{ .plain = stream.reader(io, read_buffer) },
             .writer = stream.writer(io, write_buffer),
         };
 
         if (target.tls) {
-            exchange.tls = try TlsSession.connect(gpa, stream, target.host, tls_insecure);
+            exchange.tls = try TlsSession.connect(gpa, stream, target.host, options.tls_insecure);
         }
         return exchange;
     }
@@ -602,7 +675,21 @@ const Exchange = struct {
 
     fn socketReader(exchange: *Exchange) *std.Io.Reader {
         if (exchange.tls) |*session| return session.reader();
-        return &exchange.reader.interface;
+        return exchange.reader.interface();
+    }
+
+    /// Whether the last read stopped because the deadline passed.
+    ///
+    /// Has to be asked rather than returned: `std.Io.Reader` collapses every failure into
+    /// `error.ReadFailed`, and the layers above deliberately treat the end of a body as
+    /// news rather than as an error — `readAll` keeps whatever arrived, and the SSE
+    /// decoder reads a closed stream as "the server is done". A deadline that expired
+    /// looks identical to both of them, so the reader is the only thing that knows.
+    fn timedOut(exchange: *const Exchange) bool {
+        return switch (exchange.reader) {
+            .plain => false,
+            .timed => |timed| if (timed.err) |err| err == error.Timeout else false,
+        };
     }
 
     fn writeRequest(
@@ -631,7 +718,13 @@ const Exchange = struct {
     }
 
     fn readHead(exchange: *Exchange, arena: std.mem.Allocator, limit: usize) Error!void {
-        exchange.response = try Response.read(exchange.socketReader(), arena, limit);
+        exchange.response = Response.read(exchange.socketReader(), arena, limit) catch |err| {
+            // A head that stopped mid-line reads as `ConnectionFailed`, which is the
+            // right name when the peer went away and the wrong one when it simply stopped
+            // talking. Only the reader can tell those apart.
+            if (exchange.timedOut()) return error.Timeout;
+            return err;
+        };
     }
 
     fn next(exchange: *Exchange, arena: std.mem.Allocator, limit: usize) Error!?[]const u8 {
@@ -640,6 +733,97 @@ const Exchange = struct {
 
     fn status(exchange: *const Exchange) u16 {
         return exchange.response.status;
+    }
+};
+
+/// A `std.Io.Reader` over a socket that gives up when nothing arrives in time.
+///
+/// `std.Io.net.Stream.Reader` waits as long as the peer likes, which is right for a
+/// stream with no deadline and wrong for a request that has one: a server which accepts
+/// the POST and then says nothing holds the caller forever. This routes the same read
+/// through `Io.operateTimeout`, so the wait is bounded by the socket becoming readable
+/// rather than by the server's cooperation.
+///
+/// **Not `SO_RCVTIMEO`**, which is the obvious alternative and does not work here. A
+/// blocking socket with a receive timeout fails a read with `EAGAIN`, and
+/// `std.Io.Threaded` treats `EAGAIN` on a blocking descriptor as a bug in its caller —
+/// `netReadPosix` maps it to `errnoBug`, which aborts the process. The socket option
+/// would turn a slow server into a panic. `recvmsg` under `operateTimeout` is the same
+/// wait expressed where the `Io` implementation can see it: `MSG_DONTWAIT` plus `poll`,
+/// on a descriptor that stays blocking.
+const TimedReader = struct {
+    io: std.Io,
+    handle: std.Io.net.Socket.Handle,
+    timeout: std.Io.Timeout,
+    interface: std.Io.Reader,
+    /// The last failure, because `std.Io.Reader` has one error for all of them and only
+    /// `error.Timeout` means the connection is still good. Read through
+    /// `Exchange.timedOut`.
+    err: ?ReadError = null,
+
+    /// Everything a bounded receive can fail with. `ConcurrencyUnavailable` is in here
+    /// because it is real: waiting concurrently needs `poll`, which WASI and a build
+    /// without it do not have, and on those targets a deadline cannot be honoured. It
+    /// surfaces as a failed read rather than as a silent unbounded wait.
+    pub const ReadError = std.Io.OperateTimeoutError || std.Io.net.Socket.ReceiveError;
+
+    fn init(
+        io: std.Io,
+        connection: std.Io.net.Stream,
+        buffer: []u8,
+        timeout_ms: u32,
+    ) TimedReader {
+        return .{
+            .io = io,
+            .handle = connection.socket.handle,
+            // `awake` rather than `boot`, so a laptop that suspends mid-request does not
+            // wake with its whole deadline already spent. What is being bounded is how
+            // long the server is allowed to stay quiet, not how long the machine was.
+            .timeout = .{ .duration = .{
+                .raw = .fromMilliseconds(timeout_ms),
+                .clock = .awake,
+            } },
+            .interface = .{ .vtable = &vtable, .buffer = buffer, .seek = 0, .end = 0 },
+        };
+    }
+
+    // Only `stream`: the default `readVec` routes through it. Implementing `readVec`
+    // would mean filling several buffers per call, and `net_receive` takes one
+    // contiguous destination, so it would gain nothing but a second code path.
+    const vtable: std.Io.Reader.VTable = .{ .stream = stream };
+
+    fn stream(
+        io_r: *std.Io.Reader,
+        io_w: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
+        const self: *TimedReader = @alignCast(@fieldParentPtr("interface", io_r));
+        const dest = limit.slice(try io_w.writableSliceGreedy(1));
+
+        // The deadline is measured per call, so it bounds the gap between bytes rather
+        // than the whole response. A stream that keeps producing keeps its connection,
+        // which is what a subscription needs.
+        var message: std.Io.net.IncomingMessage = .init;
+        const result = self.io.operateTimeout(.{ .net_receive = .{
+            .socket_handle = self.handle,
+            .message_buffer = (&message)[0..1],
+            .data_buffer = dest,
+            .flags = .{},
+        } }, self.timeout) catch |err| {
+            self.err = err;
+            return error.ReadFailed;
+        };
+
+        const failure, const count = result.net_receive;
+        if (failure) |err| {
+            self.err = err;
+            return error.ReadFailed;
+        }
+        assert(count == 1);
+        // A stream socket delivering zero bytes is the peer closing, not a short read.
+        if (message.data.len == 0) return error.EndOfStream;
+        io_w.advance(message.data.len);
+        return message.data.len;
     }
 };
 
@@ -681,7 +865,13 @@ pub const Response = struct {
         var streaming = false;
         var challenge: ?[]const u8 = null;
 
-        while (true) {
+        // Each line is bounded, but a head made of nothing but lines was not: the loop
+        // ended when the server chose to send its blank line, and every header until then
+        // was kept in the arena. Refused rather than truncated, because a head this long
+        // is not a response worth trying to interpret.
+        var lines: usize = 0;
+        while (true) : (lines += 1) {
+            if (lines == head_lines_max) return error.MalformedResponse;
             const line = try readLine(source, arena, head_line_bytes_max);
             if (line.len == 0) break;
 
@@ -757,22 +947,38 @@ pub const Response = struct {
     }
 };
 
-/// Reads a whole body into `arena`.
+/// Reads a whole body into `arena`, refusing one that runs past `limit`.
+///
+/// The bound is applied while the body arrives rather than after it has all been
+/// buffered, and that is the whole point of not using `streamRemaining` here. Only a
+/// declared `Content-Length` can be refused up front, which `Response.read` does; the
+/// other two framings have no length to check. So a `Transfer-Encoding: chunked` body, or
+/// a `Connection: close` body with no length at all, was bounded by nothing but the
+/// server's willingness to stop — every byte it chose to send was allocated first and
+/// measured second.
+///
+/// One byte past `limit` is read on purpose: reaching `limit + 1` is what distinguishes a
+/// body that exactly fills the bound from one that exceeds it.
 fn readAll(reader: *std.Io.Reader, arena: std.mem.Allocator, limit: usize) Error![]const u8 {
-    var allocating: std.Io.Writer.Allocating = .init(arena);
-    errdefer allocating.deinit();
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(arena);
 
-    _ = reader.streamRemaining(&allocating.writer) catch |err| switch (err) {
-        error.WriteFailed => return error.OutOfMemory,
+    reader.appendRemaining(arena, &list, .limited(limit +| 1)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.StreamTooLong => return error.MessageTooLarge,
         // A truncated body is whatever arrived; the caller decides whether it parses.
+        // `appendRemaining` hands the bytes it managed to read back either way.
         error.ReadFailed => {},
     };
-    if (allocating.written().len > limit) return error.MessageTooLarge;
-    return allocating.written();
+    return list.items;
 }
 
 /// Upper bound on one line of a response head.
 const head_line_bytes_max: usize = 8 * 1024;
+
+/// Upper bound on how many lines a response head may have, counting the status line.
+/// Generous for anything a server has reason to send, and finite, which is the point.
+const head_lines_max: usize = 128;
 
 const Target = struct {
     /// The bare host, with an IPv6 literal's brackets removed: what a resolver and a
@@ -1481,16 +1687,24 @@ fn drain(arena: std.mem.Allocator, raw: []const u8, framing: BodyReader.Framing)
     return allocating.written();
 }
 
-/// Collects every message a raw HTTP response yields.
-fn messagesOf(arena: std.mem.Allocator, raw: []const u8) !struct {
+const Collected = struct {
     status: u16,
     messages: []const []const u8,
-} {
+};
+
+/// Collects every message a raw HTTP response yields.
+fn messagesOf(arena: std.mem.Allocator, raw: []const u8) !Collected {
+    return messagesOfLimited(arena, raw, jsonrpc.message_size_max);
+}
+
+/// The same, with the bound as a parameter, so a test can exceed it without allocating
+/// 16 MiB to do it.
+fn messagesOfLimited(arena: std.mem.Allocator, raw: []const u8, limit: usize) !Collected {
     var source: std.Io.Reader = .fixed(raw);
-    var response: Response = try .read(&source, arena, jsonrpc.message_size_max);
+    var response: Response = try .read(&source, arena, limit);
 
     var list: std.ArrayListUnmanaged([]const u8) = .empty;
-    while (try response.next(arena, jsonrpc.message_size_max)) |message| {
+    while (try response.next(arena, limit)) |message| {
         try list.append(arena, message);
     }
     return .{ .status = response.status, .messages = list.items };
@@ -1659,6 +1873,61 @@ test "a declared length beyond the bound is refused before reading it" {
     );
 }
 
+test "a body with no declared length is still bounded" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    // The two framings `Response.read` cannot refuse up front. A server sending them has
+    // no obligation to stop, so the bound has to be applied to what arrives.
+    const filler = try gpa.alloc(u8, 4096);
+    @memset(filler, 'x');
+
+    const closing = try std.fmt.allocPrint(
+        gpa,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{s}",
+        .{filler},
+    );
+    try testing.expectError(error.MessageTooLarge, messagesOfLimited(gpa, closing, 1024));
+
+    const chunked = try std.fmt.allocPrint(
+        gpa,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" ++
+            "Transfer-Encoding: chunked\r\n\r\n{x}\r\n{s}\r\n0\r\n\r\n",
+        .{ filler.len, filler },
+    );
+    try testing.expectError(error.MessageTooLarge, messagesOfLimited(gpa, chunked, 1024));
+
+    // And a body that exactly fills the bound is accepted, which is what makes the
+    // one-byte overshoot in `readAll` the right amount rather than an off-by-one.
+    const exact = try std.fmt.allocPrint(
+        gpa,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{s}",
+        .{filler},
+    );
+    const result = try messagesOfLimited(gpa, exact, filler.len);
+    try testing.expectEqual(filler.len, result.messages[0].len);
+}
+
+test "a head made of nothing but headers is refused rather than buffered" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var head: std.ArrayListUnmanaged(u8) = .empty;
+    try head.appendSlice(gpa, "HTTP/1.1 200 OK\r\n");
+    for (0..head_lines_max + 1) |index| {
+        try head.print(gpa, "X-Filler-{d}: value\r\n", .{index});
+    }
+    // No blank line, on purpose: a server that never sends one is exactly the case the
+    // count guards against.
+    var source: std.Io.Reader = .fixed(head.items);
+    try testing.expectError(
+        error.MalformedResponse,
+        Response.read(&source, gpa, jsonrpc.message_size_max),
+    );
+}
+
 test "a head that is not HTTP is refused" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -1798,6 +2067,170 @@ test "fuzz the chunk decoder against arbitrary bodies" {
             _ = drain(arena.allocator(), raw[0..len], .{ .length = len }) catch {};
         }
     }.run, .{});
+}
+
+// --- the receive deadline, against a real socket ----------------------------
+
+/// A server that takes the request and then answers on a schedule of its own.
+///
+/// Real sockets, because the deadline is the one thing here that a fixed buffer cannot
+/// exercise: `Reader.fixed` never blocks, so every timing property is invisible to it.
+const SlowServer = struct {
+    port: u16,
+    /// Milliseconds between the response's SSE events. Read as the gap *before* each one,
+    /// so a server with no events waits forever, which is the failure under test.
+    gap_ms: u32,
+    /// How many SSE events to send. Zero means the request is accepted and never
+    /// answered.
+    events: usize,
+
+    ready: std.atomic.Value(bool) = .init(false),
+    failed: std.atomic.Value(bool) = .init(false),
+    /// Set by the test once it has what it needs, so a server holding a connection open
+    /// on purpose still gets torn down.
+    stop: std.atomic.Value(bool) = .init(false),
+
+    fn fail(state: *SlowServer) void {
+        state.failed.store(true, .release);
+        state.ready.store(true, .release);
+    }
+};
+
+fn slowServerThread(state: *SlowServer) void {
+    // Its own allocator and runtime: this thread must not share the scheduler whose
+    // blocking behaviour the test is measuring.
+    const gpa = std.heap.page_allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var address = std.Io.net.IpAddress.resolve(io, "127.0.0.1", state.port) catch
+        return state.fail();
+    var listener = address.listen(io, .{ .reuse_address = true }) catch return state.fail();
+    defer listener.deinit(io);
+    state.ready.store(true, .release);
+
+    const connection = listener.accept(io) catch return state.fail();
+    defer connection.close(io);
+
+    // Read the request head to its blank line. Without this the test would prove only
+    // that an unread socket blocks; the reported failure is a server that *received* the
+    // request and then went quiet.
+    var read_buffer: [4096]u8 = undefined;
+    var request = connection.reader(io, &read_buffer);
+    while (true) {
+        const line = request.interface.takeDelimiterExclusive('\n') catch return state.fail();
+        if (std.mem.trimEnd(u8, line, "\r").len == 0) break;
+    }
+
+    var write_buffer: [1024]u8 = undefined;
+    var response = connection.writer(io, &write_buffer);
+    const out = &response.interface;
+
+    if (state.events > 0) {
+        out.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n" ++
+            "Transfer-Encoding: chunked\r\n\r\n") catch return state.fail();
+        out.flush() catch return state.fail();
+
+        var sent: usize = 0;
+        while (sent < state.events) : (sent += 1) {
+            const gap: std.Io.Clock.Duration = .{
+                .raw = .fromMilliseconds(state.gap_ms),
+                .clock = .awake,
+            };
+            gap.sleep(io) catch return;
+
+            const event = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\r\n\r\n";
+            out.print("{x}\r\n{s}\r\n", .{ event.len, event }) catch return state.fail();
+            out.flush() catch return state.fail();
+        }
+        out.writeAll("0\r\n\r\n") catch return state.fail();
+        out.flush() catch return state.fail();
+    }
+
+    // Hold the connection open. Closing it would produce end-of-stream, which is the one
+    // outcome that must not be confused with the deadline.
+    while (!state.stop.load(.acquire)) {
+        const tick: std.Io.Clock.Duration = .{ .raw = .fromMilliseconds(10), .clock = .awake };
+        tick.sleep(io) catch return;
+    }
+}
+
+/// Fixed ports, because `std.Io.net.Server` cannot be asked what it bound. Unusual enough
+/// that a collision is a failure rather than a silent pass against something else.
+const silent_test_port: u16 = 18493;
+const chatty_test_port: u16 = 18494;
+
+test "a server that takes the request and says nothing hits the deadline" {
+    const state = try testing.allocator.create(SlowServer);
+    defer testing.allocator.destroy(state);
+    state.* = .{ .port = silent_test_port, .gap_ms = 0, .events = 0 };
+
+    var thread = try std.Thread.spawn(.{}, slowServerThread, .{state});
+    defer {
+        state.stop.store(true, .release);
+        thread.join();
+    }
+    while (!state.ready.load(.acquire)) std.Thread.yield() catch {};
+    if (state.failed.load(.acquire)) return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const url = std.fmt.comptimePrint("http://127.0.0.1:{d}/mcp", .{silent_test_port});
+    var transport: Transport = .init(testing.allocator, io, url, .{
+        .receive_timeout_ms = 150,
+    });
+    defer transport.deinit();
+
+    const started = std.Io.Clock.awake.now(io);
+    // The deadline expires while the response head is being read, so `send` is where it
+    // surfaces — `send` posts the body *and* reads the head. Without it this call never
+    // returns, which is the whole of the reported bug.
+    try testing.expectError(
+        error.Timeout,
+        transport.send("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}"),
+    );
+    // Returning instantly would mean something else failed and got named `Timeout`.
+    // Half the deadline, because a coarse clock may round the wait down.
+    try testing.expect(started.untilNow(io, .awake).toMilliseconds() >= 75);
+}
+
+test "a server that keeps talking keeps its connection past the deadline" {
+    // The property a subscription depends on: the deadline is a gap between bytes, not a
+    // bound on the exchange. Three 100 ms gaps against a 400 ms deadline — each gap well
+    // inside it, the total well past it — so an implementation that armed one deadline
+    // for the whole response would fail here and only here.
+    const state = try testing.allocator.create(SlowServer);
+    defer testing.allocator.destroy(state);
+    state.* = .{ .port = chatty_test_port, .gap_ms = 100, .events = 3 };
+
+    var thread = try std.Thread.spawn(.{}, slowServerThread, .{state});
+    defer {
+        state.stop.store(true, .release);
+        thread.join();
+    }
+    while (!state.ready.load(.acquire)) std.Thread.yield() catch {};
+    if (state.failed.load(.acquire)) return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const url = std.fmt.comptimePrint("http://127.0.0.1:{d}/mcp", .{chatty_test_port});
+    var transport: Transport = .init(testing.allocator, threaded.io(), url, .{
+        .receive_timeout_ms = 400,
+    });
+    defer transport.deinit();
+
+    try transport.send("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}");
+
+    var received: usize = 0;
+    while (try transport.receive(arena.allocator())) |_| received += 1;
+    try testing.expectEqual(@as(usize, 3), received);
 }
 
 // --- https, end to end -----------------------------------------------------
