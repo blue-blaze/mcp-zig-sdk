@@ -301,6 +301,9 @@ fn promptArguments(comptime Args: type) []const types.PromptArgument {
     const derived = struct {
         const list = build: {
             if (Args == void) break :build &.{};
+            // Prompt arguments skip `ofArguments` but not `decodeArguments`, so the
+            // check that keeps `required` honest has to be repeated here.
+            schema_gen.requireDecodable(Args);
             var arguments: []const types.PromptArgument = &.{};
             for (@typeInfo(Args).@"struct".fields) |field| {
                 if (field.is_comptime) continue;
@@ -861,9 +864,13 @@ test "a comptime tool derives its schema from the handler's argument type" {
     try testing.expectEqualStrings("add", definition.name);
     try testing.expectEqualStrings("Adds two numbers", definition.description.?);
     try testing.expectEqualStrings(
-        \\{"type":"object","properties":{"a":{"type":"integer","description":"First addend"},
+        \\{"type":"object","properties":{"a":{"type":"integer","minimum":-9223372036854775808,
     ++
-        \\"b":{"type":"integer","description":"Second addend"}},
+        \\"maximum":9223372036854775807,"description":"First addend"},
+    ++
+        \\"b":{"type":"integer","minimum":-9223372036854775808,
+    ++
+        \\"maximum":9223372036854775807,"description":"Second addend"}},
     ++
         \\"required":["a","b"],"additionalProperties":false}
     , definition.input_schema.raw);
@@ -953,7 +960,9 @@ test "a tool advertises an output schema when one is declared" {
     const Output = struct { sum: i64 };
     const definition = tool("add", addTool, .{ .Output = Output });
     try testing.expectEqualStrings(
-        \\{"type":"object","properties":{"sum":{"type":"integer"}},
+        \\{"type":"object","properties":{"sum":{"type":"integer","minimum":-9223372036854775808,
+    ++
+        \\"maximum":9223372036854775807}},
     ++
         \\"required":["sum"],"additionalProperties":false}
     , definition.output_schema.?.raw);
@@ -1373,9 +1382,13 @@ test "a tool descriptor serializes with the generated schema inline" {
     try testing.expectEqualStrings(
         \\{"name":"add","inputSchema":{"type":"object","properties":
     ++
-        \\{"a":{"type":"integer","description":"First addend"},
+        \\{"a":{"type":"integer","minimum":-9223372036854775808,
     ++
-        \\"b":{"type":"integer","description":"Second addend"}},"required":["a","b"],
+        \\"maximum":9223372036854775807,"description":"First addend"},
+    ++
+        \\"b":{"type":"integer","minimum":-9223372036854775808,
+    ++
+        \\"maximum":9223372036854775807,"description":"Second addend"}},"required":["a","b"],
     ++
         \\"additionalProperties":false},"description":"Adds two numbers"}
     , bytes);

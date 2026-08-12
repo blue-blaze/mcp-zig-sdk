@@ -15,16 +15,30 @@
 //! | Zig                        | JSON Schema |
 //! |---|---|
 //! | `bool`                     | `{"type":"boolean"}` |
-//! | `i32`, `u8`, …             | `{"type":"integer"}`, with `minimum: 0` when unsigned |
+//! | `i32`, `u8`, …             | `{"type":"integer"}`, with the type's own `minimum`/`maximum` |
 //! | `f32`, `f64`               | `{"type":"number"}` |
 //! | `[]const u8`               | `{"type":"string"}` |
 //! | `enum`                     | `{"type":"string","enum":[…]}` |
 //! | `struct`                   | `{"type":"object","properties":…,"required":…}` |
 //! | `[]const T`, `[N]T`        | `{"type":"array","items":…}` |
-//! | `?T`                       | schema of `T`, and the field is not required |
+//! | `?T = null`                | schema of `T`, and the field is not required |
 //! | `std.json.Value`           | `{}` — any JSON |
 //!
 //! Anything else is a compile error rather than a silently wrong schema.
+//!
+//! ## The schema and the decoder must agree
+//!
+//! Whatever the schema says about a field, `std.json` is what actually decodes it, and
+//! anywhere the two disagree the schema is a lie a model will act on. Both places that
+//! could disagree are closed rather than documented:
+//!
+//! * An integer's bounds are the Zig type's, not just `minimum: 0`. A `u8` advertised as
+//!   "any non-negative integer" accepts `300` by its own schema and then fails to decode,
+//!   so the caller is blamed for obeying the contract it was given.
+//! * `?T` must be written `?T = null`, enforced by `requireDecodable`. Without the
+//!   default the schema leaves the field out of `required` while `std.json` refuses to
+//!   fill it, so omitting it — exactly what the schema permits — fails with
+//!   `error.MissingField`.
 //!
 //! ## Descriptions and annotations
 //!
@@ -101,10 +115,53 @@ pub fn ofArguments(comptime T: type) []const u8 {
                 @compileError("tool arguments must be a struct or void, found " ++ @typeName(T));
             }
             validateHeaderAnnotations(T);
+            requireDecodable(T);
             break :build of(T);
         };
     };
     return generated.text;
+}
+
+/// Rejects, at compile time, an argument type the generated schema would describe wrongly.
+///
+/// One thing goes wrong here, in both directions. A field left out of `required` is
+/// advertised as omittable, and for a *result* that is the truth — the server fills the
+/// struct and nothing decodes it. On the way *in*, `std.json` is what decodes, and it
+/// returns `error.MissingField` for an absent field that has no default; an `?T` is not
+/// quietly filled with null. So `city: ?[]const u8` publishes a schema saying the field
+/// may be omitted and then fails, with `InvalidParams`, every call that omits it — the
+/// caller is blamed for having read the schema.
+///
+/// `city: ?[]const u8 = null` is the whole fix, and it is the author's to write rather
+/// than ours to infer. Injecting the default would make the two spellings mean the same
+/// thing, when one of them is a mistake and the other is a decision; and it cannot be done
+/// where it would need to be, since a nested struct's fields belong to a type this
+/// generator only reads.
+///
+/// Called from `ofArguments`, not from `of`, because `of` also generates `outputSchema`,
+/// where an `?T` with no default is correct.
+pub fn requireDecodable(comptime T: type) void {
+    comptime {
+        if (T == std.json.Value) return;
+        switch (@typeInfo(T)) {
+            .optional => |info| requireDecodable(info.child),
+            .@"struct" => |info| for (info.fields) |field| {
+                if (field.is_comptime) continue;
+                if (@typeInfo(field.type) == .optional and field.default_value_ptr == null) {
+                    @compileError("field '" ++ field.name ++ "' of " ++ @typeName(T) ++
+                        " is optional with no default, so the schema would say it may be" ++
+                        " omitted while the decoder requires it; write '" ++ field.name ++
+                        ": " ++ @typeName(field.type) ++ " = null'");
+                }
+                requireDecodable(field.type);
+            },
+            .pointer => |info| if (info.size == .slice and info.child != u8) {
+                requireDecodable(info.child);
+            },
+            .array => |info| if (info.child != u8) requireDecodable(info.child),
+            else => {},
+        }
+    }
 }
 
 /// The `x-mcp-header` name a field is mirrored into, if any.
@@ -197,11 +254,16 @@ fn writeSchema(
             writeDescription(buffer, description, true);
             buffer.* = buffer.* ++ "}";
         },
-        .int => |info| {
-            buffer.* = buffer.* ++ "{\"type\":\"integer\"";
-            // An unsigned Zig field cannot hold a negative value, so say so
-            // rather than letting a caller send one and get a decode error.
-            if (info.signedness == .unsigned) buffer.* = buffer.* ++ ",\"minimum\":0";
+        .int => {
+            // The bounds are the Zig type's own, both of them. `{"type":"integer"}`
+            // describes a wider set of values than the field can hold, so a caller
+            // that obeys the schema — `300` for a `u8` — is then refused by the
+            // decoder for doing exactly what it was told was allowed. A model given
+            // the real range can pick a value that works instead of retrying.
+            buffer.* = buffer.* ++ std.fmt.comptimePrint(
+                "{{\"type\":\"integer\",\"minimum\":{d},\"maximum\":{d}",
+                .{ std.math.minInt(T), std.math.maxInt(T) },
+            );
             writeDescription(buffer, description, true);
             buffer.* = buffer.* ++ "}";
         },
@@ -491,7 +553,7 @@ test "scalars map onto their JSON Schema types" {
         \\{"type":"boolean"}
     );
     try expectSchema(i64,
-        \\{"type":"integer"}
+        \\{"type":"integer","minimum":-9223372036854775808,"maximum":9223372036854775807}
     );
     try expectSchema(f64,
         \\{"type":"number"}
@@ -501,18 +563,48 @@ test "scalars map onto their JSON Schema types" {
     );
 }
 
-test "unsigned integers declare a lower bound" {
-    // A caller cannot send -1 to a u8 field, and the schema should say so rather
-    // than leaving the model to discover it through a decode error.
+test "integers carry the bounds of their Zig type" {
+    // Neither -1 nor 300 fits a u8 field, and the schema says both rather than
+    // leaving the model to discover the second one through a decode error.
     try expectSchema(u8,
-        \\{"type":"integer","minimum":0}
+        \\{"type":"integer","minimum":0,"maximum":255}
     );
     try expectSchema(u64,
-        \\{"type":"integer","minimum":0}
+        \\{"type":"integer","minimum":0,"maximum":18446744073709551615}
     );
     try expectSchema(i8,
-        \\{"type":"integer"}
+        \\{"type":"integer","minimum":-128,"maximum":127}
     );
+}
+
+test "an advertised integer bound is one the decoder agrees with" {
+    // The point of the bound: what the schema permits and what `std.json` accepts
+    // have to be the same set. This is the pair that used to disagree.
+    const Args = struct { days: u8 };
+    const generated = of(Args);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, generated, .{});
+    defer parsed.deinit();
+    const days = parsed.value.object.get("properties").?.object.get("days").?.object;
+    const maximum = days.get("maximum").?.integer;
+    try testing.expectEqual(@as(i64, 255), maximum);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    // At the advertised ceiling, decoding succeeds.
+    const at_limit = try std.json.parseFromSliceLeaky(
+        Args,
+        arena.allocator(),
+        "{\"days\":255}",
+        .{},
+    );
+    try testing.expectEqual(@as(u8, 255), at_limit.days);
+    // One past it, the schema now refuses first instead of the decoder refusing last.
+    try testing.expectError(error.Overflow, std.json.parseFromSliceLeaky(
+        Args,
+        arena.allocator(),
+        "{\"days\":256}",
+        .{},
+    ));
 }
 
 test "enums become string enumerations" {
@@ -534,7 +626,7 @@ test "structs describe properties and required fields" {
     try expectSchema(Args,
         \\{"type":"object","properties":{"city":{"type":"string"},
     ++
-        \\"days":{"type":"integer","minimum":0}},
+        \\"days":{"type":"integer","minimum":0,"maximum":255}},
     ++
         \\"required":["city","days"],"additionalProperties":false}
     );
@@ -561,7 +653,7 @@ test "defaulted fields are not required" {
         limit: u32 = 10,
     };
     try expectSchema(Args,
-        \\{"type":"object","properties":{"limit":{"type":"integer","minimum":0}},
+        \\{"type":"object","properties":{"limit":{"type":"integer","minimum":0,"maximum":4294967295}},
     ++
         \\"additionalProperties":false}
     );
@@ -583,7 +675,7 @@ test "slices become arrays" {
     try expectSchema(Args,
         \\{"type":"object","properties":{"tags":{"type":"array","items":{"type":"string"}},
     ++
-        \\"scores":{"type":"array","items":{"type":"integer"}}},
+        \\"scores":{"type":"array","items":{"type":"integer","minimum":-2147483648,"maximum":2147483647}}},
     ++
         \\"required":["tags","scores"],"additionalProperties":false}
     );
@@ -591,7 +683,9 @@ test "slices become arrays" {
 
 test "fixed-size arrays carry length bounds" {
     try expectSchema([3]i32,
-        \\{"type":"array","items":{"type":"integer"},"minItems":3,"maxItems":3}
+        \\{"type":"array","items":{"type":"integer","minimum":-2147483648,
+    ++
+        \\"maximum":2147483647},"minItems":3,"maxItems":3}
     );
     // A byte array is a string, not an array of integers.
     try expectSchema([4]u8,
@@ -631,7 +725,9 @@ test "descriptions come from the schema_docs declaration" {
     try expectSchema(Args,
         \\{"type":"object","properties":{"city":{"type":"string","description":"The city to look up"},
     ++
-        \\"days":{"type":"integer","minimum":0,"description":"How many days to forecast"}},
+        \\"days":{"type":"integer","minimum":0,"maximum":255,
+    ++
+        \\"description":"How many days to forecast"}},
     ++
         \\"required":["city"],"additionalProperties":false}
     );
@@ -808,6 +904,63 @@ test "generated schemas decode the values they describe" {
     , .{});
     try testing.expect(minimal.days == null);
     try testing.expectEqual(.metric, minimal.units);
+}
+
+test "every field the schema leaves out of required can really be omitted" {
+    const Args = struct {
+        city: []const u8,
+        days: ?u8 = null,
+        units: enum { metric, imperial } = .metric,
+        tags: ?[]const []const u8 = null,
+    };
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, gpa, ofArguments(Args), .{});
+    const properties = schema.object.get("properties").?.object;
+    const required: []const std.json.Value = if (schema.object.get("required")) |value|
+        value.array.items
+    else
+        &.{};
+
+    // Driven off the generated schema rather than off a list written here, so the
+    // assertion cannot drift away from what the schema actually claims.
+    var checked: usize = 0;
+    for (properties.keys()) |name| {
+        for (required) |entry| {
+            if (std.mem.eql(u8, entry.string, name)) break;
+        } else {
+            checked += 1;
+            var payload = try std.json.parseFromSliceLeaky(std.json.Value, gpa,
+                \\{"city":"Seattle","days":3,"units":"imperial","tags":["a"]}
+            , .{});
+            try testing.expect(payload.object.orderedRemove(name));
+            const bytes = try std.json.Stringify.valueAlloc(gpa, payload, .{});
+            _ = std.json.parseFromSliceLeaky(Args, gpa, bytes, .{}) catch {
+                // The schema said this property was optional and the decoder
+                // disagreed, which is the exact drift `requireDecodable` exists to
+                // make impossible.
+                std.debug.print("omitting '{s}' is allowed by the schema but fails to decode\n", .{name});
+                return error.SchemaDisagreesWithDecoder;
+            };
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), checked);
+}
+
+test "argument schemas reject an optional with no default" {
+    // The rejection itself is a compile error and cannot be asserted here; what this
+    // test pins is the other half — that `?T = null` passes, so the check cannot be
+    // satisfied by refusing every optional. Negative-verified by deleting the
+    // `= null` on `note`, which fails the build with the message naming the field.
+    const Args = struct {
+        city: []const u8,
+        note: ?[]const u8 = null,
+    };
+    const generated = ofArguments(Args);
+    try testing.expect(std.mem.indexOf(u8, generated, "\"required\":[\"city\"]") != null);
 }
 
 test "generation costs nothing at run time" {

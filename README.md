@@ -72,6 +72,32 @@ still type-checks the path it cannot run. The round trip was negative-verified b
 making the client *verify* the self-signed certificate: it then fails, which is what
 proves a TLS handshake is happening rather than a plaintext connection succeeding.
 
+## Tool arguments
+
+A tool's `inputSchema` is derived from its handler's argument type at compile time, so the
+schema and the code that decodes against it cannot disagree — and where they could, the
+build stops rather than the call:
+
+```zig
+const ForecastArgs = struct {
+    city: []const u8,
+    days: u8 = 3,
+    units: ?enum { metric, imperial } = null,   // `= null` is required, see below
+
+    pub const schema_docs = .{ .city = "The city to look up" };
+};
+```
+
+Two rules follow from `std.json` being the decoder, both enforced by `schema_gen`:
+
+- **An optional field must be written `?T = null`.** Without the default, the schema leaves
+  the field out of `required` while `std.json` still demands it be present, so the tool
+  advertises a field as omittable and then rejects every call that omits it. That is a
+  compile error naming the field and the fix.
+- **An integer carries its Zig type's own bounds.** A `u8` is `minimum: 0, maximum: 255`,
+  not just `{"type":"integer"}`, because a model that sent `300` to a bare integer schema
+  was obeying the contract and getting `InvalidParams` for it.
+
 ## Authorization
 
 An HTTP server becomes a protected resource by handing the transport a guard, and a
