@@ -1,10 +1,24 @@
 //! The client side, assembled: discovery, scope selection, the authorization code
-//! flow, refresh, and step-up.
+//! flow, refresh, step-up, and the client credentials flow.
 //!
 //! Everything here composes the pure modules with `http.Fetcher`. The security
 //! decisions live in those modules; what this file adds is the *order* and the
 //! fallbacks, which is where a client that implements every rule individually can
 //! still end up not working.
+//!
+//! ## Two flows, and they are not interchangeable
+//!
+//! `beginAuthorization` / `completeAuthorization` authorize an agent on behalf of a
+//! person: a browser, a redirect, PKCE, a token carrying the user's authority. That is
+//! the flow the MCP specification describes.
+//!
+//! `clientCredentials` authorizes a process as itself, which is what a server-to-server
+//! deployment needs and what the specification does not cover. Discovery is shared;
+//! everything else is skipped.
+//!
+//! Which one a deployment needs is not a preference. A token from the second carries the
+//! *client's* authority, so using it while acting for a user gives every user of that
+//! agent whatever the process is allowed to do.
 //!
 //! ## Discovery is a chain with a fallback at every link
 //!
@@ -66,6 +80,9 @@ pub const Error = error{
     PkceUnsupported,
     /// The authorization server does not publish the endpoint this step needs.
     EndpointMissing,
+    /// The authorization server publishes its supported grants and this is not one of
+    /// them.
+    GrantUnsupported,
     /// No registration mechanism works with this authorization server.
     RegistrationUnavailable,
     /// The client's own configuration is not usable.
@@ -482,6 +499,80 @@ pub const Client = struct {
             .resource = tokens.resource,
             // A refresh keeps the scopes it had unless the server says otherwise.
             .requested_scopes = tokens.scopes,
+            .now = now,
+        }, diagnosis);
+    }
+
+    /// Obtains a token for this process itself, with no user involved.
+    ///
+    /// The whole authorization code flow above — `beginAuthorization`,
+    /// `completeAuthorization`, the browser, the redirect, PKCE — exists to authorize an
+    /// agent on behalf of a person. This is the other deployment: one service calling
+    /// another with an identity of its own. Skip straight to here; nothing above is
+    /// needed, and `discoverResource` plus `discoverAuthorizationServer` still are,
+    /// because the token endpoint and the resource identifier come from the same place
+    /// either way.
+    ///
+    /// `resource` should be `Resource.identifier` from discovery. `scopes` is a request,
+    /// not a narrowing — there is no prior grant here — so ask for what the deployment
+    /// needs; `initialScopes` computes it from the resource's metadata as usual.
+    ///
+    /// The returned token set will normally have no refresh token, which is correct and
+    /// nothing to work around: call this again. See `token.buildClientCredentials` for
+    /// why, and for why a client acting for a user must not use this.
+    pub fn clientCredentials(
+        client: *const Client,
+        arena: std.mem.Allocator,
+        server: *const AuthorizationServer,
+        resource: []const u8,
+        scopes: ?[]const u8,
+        now: i64,
+        diagnosis: *Diagnosis,
+    ) Error!token.TokenSet {
+        if (!client.options.registration.usableAt(server.issuer)) {
+            client.report(
+                "oauth: registration is not valid at {s}; re-register\n",
+                .{server.issuer},
+            );
+            return error.RegistrationUnavailable;
+        }
+
+        // A published list that omits the grant is the server's own answer, and this
+        // request would put a client secret on the wire to be refused. An absent list
+        // is not an answer — see `supportsGrantType` — so it proceeds.
+        if (server.metadata.supportsGrantType("client_credentials")) |supported| {
+            if (!supported) {
+                client.report(
+                    "oauth: {s} does not offer client_credentials\n",
+                    .{server.issuer},
+                );
+                return error.GrantUnsupported;
+            }
+        }
+
+        const endpoint = server.metadata.tokenEndpoint() catch return error.EndpointMissing;
+        const request = token.buildClientCredentials(arena, .{
+            .client_id = client.options.registration.clientId(),
+            .resource = resource,
+            .scopes = scopes,
+            .auth = client.options.registration.auth(),
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ClientAuthenticationRequired => {
+                client.report(
+                    "oauth: client_credentials needs a client secret; this " ++
+                        "registration is public\n",
+                    .{},
+                );
+                return error.InvalidConfiguration;
+            },
+            else => return error.InvalidConfiguration,
+        };
+
+        return client.postToken(arena, endpoint, request, .{
+            .issuer = server.issuer,
+            .resource = resource,
+            .requested_scopes = scopes orelse "",
             .now = now,
         }, diagnosis);
     }
@@ -1018,6 +1109,77 @@ test "refresh refuses a token set bound elsewhere" {
         1_700_000_000,
         &diagnosis,
     ));
+}
+
+test "clientCredentials refuses before it can put a secret on the wire" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var diagnosis: Diagnosis = .{};
+    // Every refusal below happens before the token endpoint is contacted, which is the
+    // point: an undefined fetcher would crash if any of them got that far.
+    const fetcher: *const http.Fetcher = undefined;
+
+    // A Client ID Metadata Document identifies a public client — the document is
+    // world-readable, so it cannot hold a secret — and this grant is nothing but the
+    // secret.
+    {
+        const client = testClient(fetcher);
+        const server = testServer();
+        try std.testing.expectError(error.InvalidConfiguration, client.clientCredentials(
+            allocator,
+            &server,
+            "https://mcp.example.com/mcp",
+            "mcp:invoke",
+            1_700_000_000,
+            &diagnosis,
+        ));
+    }
+
+    const confidential: Options = .{
+        .resource = "https://mcp.example.com/mcp",
+        .redirect_uri = "http://127.0.0.1:3000/callback",
+        .registration = .{ .pre_registered = .{
+            .client_id = "gateway-caller",
+            .client_secret = "s3cr3t",
+            .issuer = "https://auth.example.com",
+        } },
+    };
+
+    // Credentials issued by one authorization server, presented to another. The client
+    // id is not a secret; the secret beside it is, and this is the request that would
+    // hand it over.
+    {
+        const client: Client = .init(fetcher, confidential);
+        var elsewhere = testServer();
+        elsewhere.issuer = "https://other.example.com";
+        elsewhere.metadata.issuer = "https://other.example.com";
+        try std.testing.expectError(error.RegistrationUnavailable, client.clientCredentials(
+            allocator,
+            &elsewhere,
+            "https://mcp.example.com/mcp",
+            null,
+            1_700_000_000,
+            &diagnosis,
+        ));
+    }
+
+    // The server published its grants and this is not among them, so the request is
+    // known to be refused — no reason to send the secret to find that out.
+    {
+        const client: Client = .init(fetcher, confidential);
+        var narrow = testServer();
+        narrow.metadata.grant_types_supported = &.{ "authorization_code", "refresh_token" };
+        try std.testing.expectError(error.GrantUnsupported, client.clientCredentials(
+            allocator,
+            &narrow,
+            "https://mcp.example.com/mcp",
+            null,
+            1_700_000_000,
+            &diagnosis,
+        ));
+    }
 }
 
 test "a challenge from a resource server drives scope selection end to end" {

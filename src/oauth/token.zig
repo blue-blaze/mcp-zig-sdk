@@ -70,6 +70,9 @@ pub const ClientAuth = union(enum) {
 
 pub const BuildError = error{
     InvalidResource,
+    /// `client_credentials` with no client secret to present. See
+    /// `buildClientCredentials`.
+    ClientAuthenticationRequired,
     OutOfMemory,
 };
 
@@ -139,6 +142,78 @@ pub fn buildRefresh(arena: std.mem.Allocator, refresh: Refresh) BuildError!Reque
         if (scopes.len > 0) try form.add("scope", scopes);
     }
     return form.finish(refresh.auth, refresh.client_id);
+}
+
+pub const ClientCredentials = struct {
+    client_id: []const u8,
+    /// The canonical URI of the MCP server (RFC 8707). Required here for the same
+    /// reason as everywhere else: a token with an unconstrained audience is replayable.
+    resource: []const u8,
+    /// What this process is asking for.
+    ///
+    /// Unlike a refresh, this is a request rather than a narrowing — there is no prior
+    /// grant to inherit from and no user to consent, so an omitted scope leaves the
+    /// decision entirely to the authorization server, and what it decides may be
+    /// nothing at all. Ask for what the deployment needs.
+    scopes: ?[]const u8 = null,
+    /// Required, and with no default — see `buildClientCredentials`.
+    auth: ClientAuth,
+};
+
+/// Builds a client credentials request: a process authenticating as itself.
+///
+/// The other two builders here serve MCP's authorization flow, which is about an agent
+/// acting on behalf of a person who can be sent to a browser. This grant is the other
+/// deployment: no user, no browser, no redirect, no PKCE, and the client is the
+/// principal rather than a delegate. It is what a server-to-server MCP client wants —
+/// one process calling another with an identity of its own — and it is the same token
+/// endpoint and the same `TokenSet` on the way back, so everything downstream of here
+/// is unchanged.
+///
+/// Which grant a deployment needs is not a preference. A token minted by this grant
+/// carries the client's own authority, so an agent that uses it while acting for a user
+/// has silently escalated: every user of that agent gets whatever the *process* is
+/// allowed to do. Use it only where the process really is the party being authorized.
+///
+/// `auth` has no default and `.none` is refused. The whole grant is "here are my
+/// credentials"; with none to present there is nothing to authenticate as, and the only
+/// thing left identifying the caller is a client id — which is not a secret, and which
+/// appears in the query string of every authorization URL this stack builds. An
+/// authorization server that honoured such a request would be handing tokens to anyone
+/// who has seen one. Refusing to send it is better than finding out which kind it is.
+///
+/// Expect no refresh token: RFC 6749 Section 4.4.3 says the server SHOULD NOT issue
+/// one, and it has little to offer here — recovery is another call to this, which costs
+/// one round trip and involves nobody. `Client.refresh` will refuse a token set from
+/// this grant for exactly that reason.
+pub fn buildClientCredentials(
+    arena: std.mem.Allocator,
+    credentials: ClientCredentials,
+) BuildError!Request {
+    assert(credentials.client_id.len > 0);
+    prm.validateResourceIdentifier(credentials.resource) catch return error.InvalidResource;
+
+    switch (credentials.auth) {
+        .none => return error.ClientAuthenticationRequired,
+        // An empty secret is the same condition arriving from a config file or an unset
+        // environment variable rather than from the code, which is the likelier way to
+        // reach it.
+        .secret_post, .secret_basic => |secret| {
+            if (secret.len == 0) return error.ClientAuthenticationRequired;
+        },
+    }
+
+    var form: Form = .init(arena);
+    try form.add("grant_type", "client_credentials");
+    // Sent in the body even under `client_secret_basic`, where the header already
+    // carries it: RFC 6749 permits it, and authorization servers that key their
+    // per-client configuration off the body parameter reject the request without it.
+    try form.add("client_id", credentials.client_id);
+    try form.add("resource", credentials.resource);
+    if (credentials.scopes) |scopes| {
+        if (scopes.len > 0) try form.add("scope", scopes);
+    }
+    return form.finish(credentials.auth, credentials.client_id);
 }
 
 /// Accumulates an `application/x-www-form-urlencoded` body.
@@ -457,6 +532,92 @@ test "buildRefresh can downscope" {
         .scopes = "files:read",
     });
     try std.testing.expect(std.mem.indexOf(u8, request.body, "scope=files%3Aread") != null);
+}
+
+test "buildClientCredentials authenticates the process and binds the audience" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    const request = try buildClientCredentials(arena.allocator(), .{
+        .client_id = "gateway-caller",
+        .resource = test_resource,
+        .scopes = "mcp:invoke files:read",
+        .auth = .{ .secret_basic = "s3cr3t" },
+    });
+
+    try std.testing.expect(
+        std.mem.indexOf(u8, request.body, "grant_type=client_credentials") != null,
+    );
+    // No user, so no code, no verifier and no redirect — sending any of them would be
+    // the client claiming a delegation that did not happen.
+    try std.testing.expect(std.mem.indexOf(u8, request.body, "code") == null);
+    try std.testing.expect(std.mem.indexOf(u8, request.body, "redirect_uri") == null);
+    // The client id travels in the body as well as the Basic header, because servers
+    // that key their per-client configuration off the body parameter need it there.
+    try std.testing.expect(
+        std.mem.indexOf(u8, request.body, "client_id=gateway-caller") != null,
+    );
+    // RFC 8707 applies here too: this grant is exactly where an unconstrained token is
+    // most dangerous, since it carries the process's own authority.
+    try std.testing.expect(
+        std.mem.indexOf(u8, request.body, "resource=https%3A%2F%2Fmcp.example.com%2Fmcp") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, request.body, "scope=mcp%3Ainvoke%20files%3Aread") != null,
+    );
+    try std.testing.expectEqualStrings("Basic Z2F0ZXdheS1jYWxsZXI6czNjcjN0", request.headers[0][1]);
+}
+
+test "buildClientCredentials refuses to run without a secret to present" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    // A public client. The grant's entire content is "here are my credentials", so with
+    // none the only thing identifying the caller is a client id — which is not a secret
+    // and appears in every authorization URL.
+    try std.testing.expectError(
+        error.ClientAuthenticationRequired,
+        buildClientCredentials(arena.allocator(), .{
+            .client_id = "public-app",
+            .resource = test_resource,
+            .auth = .none,
+        }),
+    );
+    // The same condition arriving from an unset environment variable, which is how it
+    // actually happens.
+    for ([_]ClientAuth{ .{ .secret_post = "" }, .{ .secret_basic = "" } }) |auth| {
+        try std.testing.expectError(
+            error.ClientAuthenticationRequired,
+            buildClientCredentials(arena.allocator(), .{
+                .client_id = "server-to-server",
+                .resource = test_resource,
+                .auth = auth,
+            }),
+        );
+    }
+}
+
+test "buildClientCredentials omits scope when none is asked for, and checks the resource" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    const request = try buildClientCredentials(arena.allocator(), .{
+        .client_id = "c",
+        .resource = test_resource,
+        .auth = .{ .secret_post = "s" },
+    });
+    // Not `scope=`, which asks for the empty scope rather than leaving it to the server.
+    try std.testing.expect(std.mem.indexOf(u8, request.body, "scope=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, request.body, "client_secret=s") != null);
+
+    try std.testing.expectError(
+        error.InvalidResource,
+        buildClientCredentials(arena.allocator(), .{
+            .client_id = "c",
+            .resource = "https://mcp.example.com/mcp#frag",
+            .auth = .{ .secret_post = "s" },
+        }),
+    );
 }
 
 test "client_secret_post puts the secret in the body" {

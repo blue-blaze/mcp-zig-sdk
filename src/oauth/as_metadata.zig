@@ -204,6 +204,22 @@ pub const Metadata = struct {
         return set;
     }
 
+    /// Whether the server lists `grant` in `grant_types_supported`.
+    ///
+    /// `null` means the document does not publish the list at all, which is not the
+    /// same as a refusal. RFC 8414 defines the default as
+    /// `["authorization_code", "implicit"]`, but servers that do support other grants
+    /// routinely omit the field, so a caller that reads absence as "no" will fail
+    /// against them. Absence is "unknown" here and what to do about it is the caller's
+    /// call; a published list that omits the grant is the server's own answer.
+    pub fn supportsGrantType(metadata: *const Metadata, grant: []const u8) ?bool {
+        const published = metadata.grant_types_supported orelse return null;
+        for (published) |candidate| {
+            if (std.mem.eql(u8, candidate, grant)) return true;
+        }
+        return false;
+    }
+
     /// True if `scopes_supported` lists `offline_access`, which is the condition
     /// under which a client may ask for it in order to receive a refresh token.
     pub fn offersOfflineAccess(metadata: *const Metadata) bool {
@@ -536,6 +552,24 @@ test "missing endpoints are named rather than silently absent" {
     const metadata: Metadata = .{ .issuer = "https://auth.example.com" };
     try std.testing.expectError(error.InvalidEndpoint, metadata.authorizationEndpoint());
     try std.testing.expectError(error.InvalidEndpoint, metadata.tokenEndpoint());
+}
+
+test "supportsGrantType tells an unpublished list apart from a refusal" {
+    const silent: Metadata = .{ .issuer = "https://auth.example.com" };
+    // Not `false`. RFC 8414's default would say client_credentials is unsupported, but
+    // servers that support it routinely omit the field, so a caller reading absence as
+    // a refusal would not work against them.
+    try std.testing.expect(silent.supportsGrantType("client_credentials") == null);
+
+    const published: Metadata = .{
+        .issuer = "https://auth.example.com",
+        .grant_types_supported = &.{ "authorization_code", "refresh_token" },
+    };
+    try std.testing.expectEqual(@as(?bool, false), published.supportsGrantType("client_credentials"));
+    try std.testing.expectEqual(@as(?bool, true), published.supportsGrantType("authorization_code"));
+    // Compared whole, not by prefix: `authorization_code` must not answer for a grant
+    // whose name it happens to begin.
+    try std.testing.expectEqual(@as(?bool, false), published.supportsGrantType("authorization"));
 }
 
 test "supportedScopes renders a set" {

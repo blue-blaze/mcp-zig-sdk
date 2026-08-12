@@ -48,6 +48,7 @@ interoperability matrix against the official TypeScript SDK and the MCP Inspecto
 | Streamable HTTP transport, server and client | done |
 | OAuth 2.1 resource server: PRM, challenges, JWT/JWKS verification | done |
 | OAuth 2.1 client: discovery, PKCE, `iss` validation, refresh, step-up | done |
+| OAuth 2.1 client: `client_credentials`, for a service authorizing as itself | done |
 | Authorization on the HTTP transport: 401/403/503, PRM endpoint, per-tool scopes | done |
 | Interoperability: official TypeScript SDK, both directions, both transports | done |
 | Interoperability: MCP Inspector, both transports | done |
