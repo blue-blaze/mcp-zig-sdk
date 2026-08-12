@@ -567,10 +567,7 @@ const Exchange = struct {
         const write_buffer = gpa.alloc(u8, connection_buffer_bytes) catch return error.OutOfMemory;
         errdefer gpa.free(write_buffer);
 
-        var address = std.Io.net.IpAddress.resolve(io, target.host, target.port) catch
-            return error.ConnectionFailed;
-        const stream = std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream }) catch
-            return error.ConnectionFailed;
+        const stream = connect(io, target.host, target.port) catch return error.ConnectionFailed;
         errdefer stream.close(io);
 
         exchange.* = .{
@@ -617,7 +614,7 @@ const Exchange = struct {
 
         writer.print("POST {s} HTTP/1.1\r\n", .{exchange.target.path}) catch
             return error.ConnectionFailed;
-        writer.print("Host: {s}\r\n", .{exchange.target.host}) catch
+        writer.print("Host: {s}\r\n", .{exchange.target.authority}) catch
             return error.ConnectionFailed;
         // One exchange per connection. Reuse would save a handshake, but a subscription
         // stream occupies its connection for as long as it lives, so a pool would have
@@ -778,7 +775,14 @@ fn readAll(reader: *std.Io.Reader, arena: std.mem.Allocator, limit: usize) Error
 const head_line_bytes_max: usize = 8 * 1024;
 
 const Target = struct {
+    /// The bare host, with an IPv6 literal's brackets removed: what a resolver and a
+    /// TLS handshake need. `[::1]` is a URL syntax, not a hostname, and neither
+    /// `IpAddress.resolve` nor `HostName.init` accepts the brackets.
     host: []const u8,
+    /// The authority exactly as the URL wrote it — brackets kept, port included when
+    /// the URL gave one. This is what `Host:` must carry: a server or proxy routing on
+    /// it needs the port whenever it is not the scheme's default.
+    authority: []const u8,
     port: u16,
     path: []const u8,
     tls: bool,
@@ -810,8 +814,35 @@ pub fn parseUrl(url: []const u8) Error!Target {
                 return error.InvalidUrl;
         }
     }
+    // Strip an IPv6 literal's brackets: they delimit the host within the authority and
+    // are not part of the address. Keeping them here is what made every `[::1]` URL
+    // fail at connect while parsing cleanly.
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') {
+        host = host[1 .. host.len - 1];
+    }
     if (host.len == 0) return error.InvalidUrl;
-    return .{ .host = host, .port = port, .path = path, .tls = tls };
+    return .{ .host = host, .authority = authority, .port = port, .path = path, .tls = tls };
+}
+
+/// Opens a TCP connection to `host`, which may be an IP literal or a name.
+///
+/// Both cases have to be handled explicitly because `IpAddress.resolve` is not a
+/// resolver despite the name: it parses literals (and resolves an IPv6 scope id to an
+/// interface index, which is the "resolve" it refers to). Names live in `HostName`,
+/// which runs the actual lookup and tries every address it gets back. Calling only the
+/// former is what made every URL addressed by name — that is, every URL whose TLS
+/// certificate can be checked — fail with `ConnectionFailed` and nothing pointing at
+/// DNS.
+///
+/// Literal first, so that an address never depends on the resolver being reachable.
+fn connect(io: std.Io, host: []const u8, port: u16) !std.Io.net.Stream {
+    if (std.Io.net.IpAddress.resolve(io, host, port)) |literal| {
+        var address = literal;
+        return std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream });
+    } else |_| {}
+
+    const name = try std.Io.net.HostName.init(host);
+    return name.connect(io, port, .{ .mode = .stream });
 }
 
 fn parseStatus(line: []const u8) Error!u16 {
@@ -1113,12 +1144,51 @@ test "parseUrl splits authority, port and path" {
 
 test "parseUrl does not mistake an IPv6 literal's colons for a port" {
     const target = try parseUrl("http://[::1]:8080/mcp");
-    try testing.expectEqualStrings("[::1]", target.host);
     try testing.expectEqual(@as(u16, 8080), target.port);
+    // Two different strings, and the difference is load-bearing: the brackets are URL
+    // syntax that no resolver accepts, while `Host:` has to keep them.
+    try testing.expectEqualStrings("::1", target.host);
+    try testing.expectEqualStrings("[::1]:8080", target.authority);
 
     const no_port = try parseUrl("http://[::1]/mcp");
-    try testing.expectEqualStrings("[::1]", no_port.host);
+    try testing.expectEqualStrings("::1", no_port.host);
+    try testing.expectEqualStrings("[::1]", no_port.authority);
     try testing.expectEqual(@as(u16, 80), no_port.port);
+}
+
+test "parseUrl keeps the port in the authority a Host header carries" {
+    // A non-default port belongs in `Host:`; dropping it misroutes on any server or
+    // proxy that dispatches on the header.
+    const target = try parseUrl("http://127.0.0.1:8787/mcp");
+    try testing.expectEqualStrings("127.0.0.1", target.host);
+    try testing.expectEqualStrings("127.0.0.1:8787", target.authority);
+
+    // A default port is written as the URL gave it, which is to say not at all.
+    const secure = try parseUrl("https://mcp.example.com/mcp");
+    try testing.expectEqualStrings("mcp.example.com", secure.host);
+    try testing.expectEqualStrings("mcp.example.com", secure.authority);
+}
+
+test "a host that is a name reaches the resolver rather than failing to parse" {
+    // The regression this guards: `IpAddress.resolve` parses literals only, so a name
+    // went straight to `ConnectionFailed`. `localhost` is enough to tell "the resolver
+    // was consulted" from "the input was rejected as not-an-IP" — a refused connection
+    // proves the lookup happened and returned an address.
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Port 1 is reserved and nothing listens there, so the connect is expected to fail.
+    // What matters is *how*: anything other than a name-validation failure means the
+    // name was accepted and looked up, which is the behaviour that was missing.
+    const result = connect(io, "localhost", 1);
+    if (result) |stream| {
+        stream.close(io);
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.InvalidHostName, error.NameTooLong => return err,
+        else => {},
+    }
 }
 
 test "parseUrl rejects anything that is not an absolute http URL" {

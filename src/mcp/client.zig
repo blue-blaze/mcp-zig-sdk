@@ -172,6 +172,10 @@ pub const Error = error{
     MessageTooLarge,
     /// The peer's reply was not a well-formed JSON-RPC response.
     Malformed,
+    /// The reply carries a `resultType` this SDK does not know, so the payload cannot
+    /// be read. Only a server on a later revision produces one; `exchange` still
+    /// returns the raw result for a caller willing to interpret it.
+    UnsupportedResultType,
     /// The peer closed the exchange without answering.
     NoResponse,
     /// The server answered with a JSON-RPC error. Inspect `Call.failure` for it.
@@ -860,6 +864,7 @@ fn mapDecode(result: anytype) Error!@typeInfo(@TypeOf(result)).error_union.paylo
     return result catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.Malformed => error.Malformed,
+        error.UnsupportedResultType => error.UnsupportedResultType,
     };
 }
 
@@ -1486,17 +1491,53 @@ test "a malformed reply is reported rather than misread" {
     );
 }
 
-test "a result missing resultType is malformed" {
+test "a result missing resultType reads as complete" {
     var fixture: Fixture = undefined;
     fixture.init(&.{
-        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"search","inputSchema":{"type":"object"}}]}}
     }, .{});
     defer fixture.deinit();
 
-    // Every result in this revision carries it, so its absence means the peer is not
-    // speaking the protocol we think it is.
+    // A server on an earlier revision sends no `resultType`, and the schema makes
+    // reading that as `complete` a client MUST — not an option a single-revision
+    // client may decline. Rejecting it here is what made this SDK unable to talk to
+    // any deployed server, so the tolerance is pinned by a test rather than left to
+    // the next reader's judgement.
+    const listed = try fixture.client.listTools(fixture.allocator(), .{});
+    try testing.expectEqual(@as(usize, 1), listed.tools.len);
+    try testing.expectEqualStrings("search", listed.tools[0].name);
+}
+
+test "an unknown resultType is refused separately from a malformed one" {
+    var fixture: Fixture = undefined;
+    fixture.init(&.{
+        \\{"jsonrpc":"2.0","id":1,"result":{"resultType":"partial","tools":[]}}
+    }, .{});
+    defer fixture.deinit();
+
+    // Tolerating absence must not become tolerating anything: a `resultType` this SDK
+    // does not know comes from a later revision, whose payload shape is unknown. The
+    // separate error is what tells a caller the fix is a newer SDK rather than a
+    // corrected peer.
     try testing.expectError(
-        error.Malformed,
+        error.UnsupportedResultType,
+        fixture.client.listTools(fixture.allocator(), .{}),
+    );
+}
+
+test "input_required is still explicit when resultType is absent elsewhere" {
+    var fixture: Fixture = undefined;
+    fixture.init(&.{
+        \\{"jsonrpc":"2.0","id":1,"result":{"resultType":"input_required","inputRequests":[]}}
+    }, .{});
+    defer fixture.deinit();
+
+    // The reason defaulting a missing field is safe: an interim result is only ever
+    // reached by a server that named it, so the tolerant path cannot silently turn one
+    // into a complete result. `listTools` cannot take that path at all, so the request
+    // is refused rather than decoded as an empty listing.
+    try testing.expectError(
+        error.InputRequired,
         fixture.client.listTools(fixture.allocator(), .{}),
     );
 }

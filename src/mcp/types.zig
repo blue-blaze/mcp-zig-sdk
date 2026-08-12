@@ -115,10 +115,12 @@ pub const Json = union(enum) {
 /// Every result carries one of these. `input_required` marks the interim result of
 /// a multi round-trip request; `complete` marks a final one.
 ///
-/// New in 2026-07-28 and required on every result. This SDK only speaks that
-/// revision, so a missing `resultType` is a protocol error rather than something
-/// to default — the backward-compatibility rule that treats it as `complete`
-/// applies to clients that also support earlier revisions.
+/// New in 2026-07-28, where a server MUST send it. A client, however, MUST accept
+/// its absence: the schema requires that a result from a server implementing an
+/// earlier revision — which has no such field — be read as `complete`. That rule is
+/// unconditional, not something a single-revision client may opt out of, so this SDK
+/// sends the field on every result it produces and defaults it on every result it
+/// reads. See `resultTypeOf`.
 pub const ResultType = enum {
     complete,
     input_required,
@@ -1577,7 +1579,15 @@ const testing = std.testing;
 // through `std.json` directly with unknown fields ignored — a client must not break
 // when a newer server adds a field.
 
-pub const DecodeError = error{ Malformed, OutOfMemory };
+pub const DecodeError = error{
+    /// The payload is not shaped like the result it claims to be.
+    Malformed,
+    /// The payload carries a `resultType` from a revision later than this SDK's, so
+    /// how to read the rest of it is unknown. Distinct from `Malformed` because the
+    /// peer is not at fault and the fix is a newer SDK, not a corrected server.
+    UnsupportedResultType,
+    OutOfMemory,
+};
 
 /// Decodes a result payload of type `T` from a parsed JSON value.
 pub fn decode(comptime T: type, arena: std.mem.Allocator, value: std.json.Value) DecodeError!T {
@@ -1599,17 +1609,29 @@ pub fn decode(comptime T: type, arena: std.mem.Allocator, value: std.json.Value)
     };
 }
 
-/// The `resultType` every result carries. A client must check this before trusting
-/// the rest: an `input_required` payload has none of the fields a complete result
-/// does, and interpreting one as the other would silently drop the server's request
-/// for more input.
+/// The `resultType` a 2026-07-28 result carries. A client must check this before
+/// trusting the rest: an `input_required` payload has none of the fields a complete
+/// result does, and interpreting one as the other would silently drop the server's
+/// request for more input.
+///
+/// An absent field reads as `complete`, which the schema requires: a server on an
+/// earlier revision does not send one, and the rule that its results be read as
+/// complete is written as a client MUST. Defaulting costs nothing, because
+/// `input_required` is only ever reached by a server that sent the field explicitly —
+/// so the tolerance cannot mask an interim result as a final one.
+///
+/// A field that is present but names something this SDK does not know is a different
+/// matter: only a later revision produces one, and guessing how to read its payload
+/// is exactly the mistake this function exists to prevent. That is
+/// `UnsupportedResultType`, kept apart from `Malformed` so a caller can tell "your
+/// peer is newer than this SDK" from "your peer is broken".
 pub fn resultTypeOf(value: std.json.Value) DecodeError!ResultType {
     const object = switch (value) {
         .object => |object| object,
         else => return error.Malformed,
     };
-    const tag = object.get("resultType") orelse return error.Malformed;
-    return enumFromValue(ResultType, tag) catch error.Malformed;
+    const tag = object.get("resultType") orelse return .complete;
+    return enumFromValue(ResultType, tag) catch error.UnsupportedResultType;
 }
 
 fn decodeDiscover(arena: std.mem.Allocator, object: std.json.ObjectMap) DecodeError!DiscoverResult {
