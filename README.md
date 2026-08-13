@@ -110,6 +110,8 @@ interoperability matrix against the official TypeScript SDK and the MCP Inspecto
 | Interoperability: official TypeScript SDK, both directions, both transports | done |
 | Interoperability: MCP Inspector, both transports | done |
 
+| Client fallback to the 2025 protocol, opt-in | done |
+
 `https://` on the client transport requires `-Dtls`, which this build forwards to
 Velo; without it an `https` URL is refused rather than silently downgraded.
 
@@ -154,6 +156,65 @@ Two rules follow from `std.json` being the decoder, both enforced by `schema_gen
 - **An integer carries its Zig type's own bounds.** A `u8` is `minimum: 0, maximum: 255`,
   not just `{"type":"integer"}`, because a model that sent `300` to a bare integer schema
   was obeying the contract and getting `InvalidParams` for it.
+
+## Talking to a server on the 2025 protocol
+
+The protocol splits into two eras, and the split is not cosmetic. Before 2026-07-28 a
+connection was stateful: `initialize`, a counter-offered version, `notifications/initialized`,
+and capabilities exchanged once. 2026-07-28 removed all of it — no handshake, and every
+request carries its own `_meta` envelope instead.
+
+This client speaks the modern era, and will cross to the older one if asked:
+
+```zig
+var client: mcp.Client = .init(transport.transport(), info, .{
+    .legacy = .negotiate,   // default is .reject
+});
+```
+
+`.negotiate` probes with `server/discover`, which is the modern era's own negotiation entry
+point — so a modern server pays nothing extra and its answer is the answer `discover`
+wanted anyway. A server that refuses gets the 2025 handshake instead, after which
+`negotiatedVersion()` reports what was agreed and `discover` returns the `InitializeResult`
+in the shape a `DiscoverResult` has, so calling code does not branch on the era.
+
+The default stays `.reject`, and that is the point of having the knob at all: a downgrade
+nobody asked for is a downgrade nobody notices. Every other leg of the interoperability
+matrix runs against a peer configured to refuse the older protocol for the same reason.
+
+What crosses the boundary, checked end to end by `interop/run.sh` leg 5 against the
+official TypeScript SDK serving 2025: `tools/list`, `tools/call`, `prompts/list`,
+`prompts/get`, `resources/list`, `resources/templates/list`, `resources/read`,
+`completion/complete`, and `progressToken` — the one `_meta` key both eras spell the same,
+because it predates the prefix convention.
+
+What does not, and is refused locally with `error.UnsupportedByRevision` rather than sent
+to earn a `-32601`:
+
+- **`subscriptions/listen`.** The older era used `resources/subscribe` plus out-of-band
+  notifications, which on Streamable HTTP means a second, long-lived `GET` stream. This
+  transport is POST-only by design, so the mapping is not a rename.
+- **The multi-round-trip input flow**, including elicitation. 2026-07-28 delivers it inside
+  a result; 2025 made it a server-to-client request on a bidirectional channel. Different
+  mechanism, not a different spelling.
+- **Per-request log level.** It is connection state in the older era, so
+  `CallOptions.log_level` cannot be honoured per call; `setLogLevel` is how to ask, and a
+  per-request one is reported and dropped rather than quietly turned into an extra request.
+
+Two things happen underneath. A legacy request carries no `_meta` at all — writing 2026
+keys onto a 2025 connection is the one thing the older wire format must never see. And
+`Mcp-Session-Id`, which those revisions made mandatory on every request after `initialize`,
+is captured from the response head and echoed on subsequent requests; that happens header
+to header, without the transport parsing a body, so it never has to learn what an
+`InitializeResult` is. The `MCP-Protocol-Version` header comes from the body's `_meta`,
+which is exactly why a legacy request sends none — an absent one is tolerated, where
+`2026-07-28` is a `400` from a server that has never heard of it.
+
+The 2025 shapes in `src/mcp/legacy.zig` are transcribed from the reference implementation,
+not from memory: `@modelcontextprotocol/server` 2.0.0 ships sourcemaps carrying its
+original `wire/rev2025-11-25/`, which is where the method list, the `initialize` params and
+the never-stamp rule come from. `spec/schema.json` here is 2026-07-28 only and says nothing
+about any of it.
 
 ## Authorization
 
@@ -376,15 +437,19 @@ cd interop && npm install
 ```
 
 `run.sh` runs all four directions, because a bug on either side of the wire shows up in
-only one of them:
+only one of them, plus a fifth leg for the older protocol:
 
 | | Streamable HTTP | stdio |
 |---|---|---|
 | TypeScript SDK client → this server | pass | pass |
 | this client → TypeScript SDK server | pass | pass |
+| this client → TypeScript SDK server on **2025** | — | pass |
 
-Both TypeScript servers run with `legacy: 'reject'` and both clients pin `2026-07-28`, so
-no leg can pass by quietly falling back to the 2025 protocol. What the legs cover beyond
+Legs 1–4 run the TypeScript servers with `legacy: 'reject'` and pin both clients to
+`2026-07-28`, so none of them can pass by quietly falling back. Leg 5 is the opposite
+experiment and needs both halves to mean anything: a server that speaks only 2025, and a
+client told it may negotiate. It uses the same `buildServer` as the others, so any
+difference in the results is the protocol era and nothing else. What the legs cover beyond
 the method surface: comptime-generated JSON Schema consumed by another SDK's validator,
 `x-mcp-header` mirrored into `Mcp-Param-*` and validated against the body in both
 directions, per-request progress and `logLevel` (both opt-in, so they prove the `_meta`

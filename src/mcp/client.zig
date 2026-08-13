@@ -42,6 +42,9 @@ const std = @import("std");
 const assert_mod = @import("assert");
 const jsonrpc = @import("jsonrpc.zig");
 const types = @import("types.zig");
+// Named `legacy_mod` because `Options.legacy` is the knob that turns it on, and one of
+// the two has to give.
+const legacy_mod = @import("legacy.zig");
 
 const assert = assert_mod.assert;
 
@@ -268,6 +271,13 @@ pub const Error = error{
     /// The server does not speak this revision. `Call.failure.data` carries the
     /// versions it does.
     UnsupportedProtocolVersion,
+    /// The method does not exist in the revision this connection negotiated.
+    ///
+    /// Only reachable with `Options.legacy = .negotiate`, against a pre-2026-07-28
+    /// server. Refused here rather than sent, because the `-32601` a server would answer
+    /// with reads as "this server lacks a feature" when the truth is "this connection
+    /// cannot express it" — and the two lead somewhere different.
+    UnsupportedByRevision,
     /// The server needs more input before it can answer. Handled by the
     /// multi-round-trip flow rather than by retrying blindly.
     InputRequired,
@@ -317,7 +327,28 @@ pub const Call = struct {
     }
 };
 
+/// Whether this client will speak to a server from before 2026-07-28.
+pub const LegacyMode = enum {
+    /// Speak 2026-07-28 and nothing else. A server on an older revision fails, with the
+    /// error it produced.
+    ///
+    /// The default, and it stays the default on purpose: falling back is a downgrade, and
+    /// a downgrade that happens without being asked for is one nobody notices. Every
+    /// interoperability leg in this repository runs against a peer configured to refuse
+    /// the older protocol, so that a passing run cannot be one that quietly fell back —
+    /// the same discipline applied to the option itself.
+    reject,
+    /// Try 2026-07-28, and fall back to the 2025 handshake if the server does not know it.
+    ///
+    /// See `legacy.zig` for what the older era can and cannot carry. In short: the
+    /// request methods both eras share all work; `subscriptions/listen` and the
+    /// multi-round-trip input flow do not exist there and are refused locally.
+    negotiate,
+};
+
 pub const Options = struct {
+    /// Whether to fall back to the 2025 protocol. Defaults to refusing.
+    legacy: LegacyMode = .reject,
     /// What this client can do, sent on every request.
     ///
     /// It must describe what the client will actually honour: a server reads this to
@@ -414,12 +445,54 @@ pub const Client = struct {
     /// Monotonic request id. Never reused within a client's lifetime, so a late
     /// response from an abandoned request can always be told apart from a fresh one.
     next_id: i64 = 1,
+    /// Which protocol era this connection settled on.
+    ///
+    /// The only mutable state besides the id counter, and it exists because the legacy
+    /// era is stateful in a way the modern one deliberately is not: a handshake happens
+    /// once, and every request after it has to be shaped by what the handshake agreed.
+    era: Era = .modern,
+
+    /// The protocol era of this connection.
+    pub const Era = union(enum) {
+        /// Not yet settled. Only reachable with `Options.legacy = .negotiate`, and only
+        /// until the first request.
+        unknown,
+        /// 2026-07-28: no handshake, a `_meta` envelope on every request.
+        modern,
+        /// Pre-2026-07-28: `initialize` completed, and what it agreed to.
+        legacy: legacy_mod.Handshake,
+    };
 
     pub fn init(transport: Transport, info: types.Implementation, options: Options) Client {
         assert(info.name.len > 0);
         assert(info.version.len > 0);
         assert(options.messages_max > 0);
-        return .{ .transport = transport, .info = info, .options = options };
+        return .{
+            .transport = transport,
+            .info = info,
+            .options = options,
+            // Under `.reject` the era is settled before a byte moves, which is what keeps
+            // the default path free of any probe or extra round trip.
+            .era = switch (options.legacy) {
+                .reject => .modern,
+                .negotiate => .unknown,
+            },
+        };
+    }
+
+    /// The revision this connection is speaking, once it is known.
+    ///
+    /// Null before the first request under `.negotiate`. Worth logging: it is the one
+    /// fact that explains why a method a server obviously has is being refused.
+    pub fn negotiatedVersion(client: *const Client) ?[]const u8 {
+        return switch (client.era) {
+            .unknown => null,
+            .modern => types.protocol_version,
+            // Captured by reference. A by-value capture would copy the `Handshake` into
+            // the switch's own temporary, and the slice this returns points into that
+            // copy's buffer — a dangling slice the moment the expression ends.
+            .legacy => |*negotiated| negotiated.negotiatedVersion(),
+        };
     }
 
     // ---- Typed API -------------------------------------------------------
@@ -429,11 +502,52 @@ pub const Client = struct {
     /// Optional in this revision — there is no handshake to complete — but it is how
     /// a client learns the server's protocol versions, capabilities and instructions,
     /// and how it discovers that it needs to speak a different revision.
+    ///
+    /// With `Options.legacy = .negotiate` this is also where negotiation naturally
+    /// happens, and it answers the same shape either way: against a pre-2026-07-28 server
+    /// the `InitializeResult` is reported as a `DiscoverResult`, so a caller does not have
+    /// to know which era it is on to read the answer. `supportedVersions` then holds the
+    /// one version the handshake agreed on, because that is all `initialize` returns — a
+    /// server states its choice, not its list.
+    ///
+    /// Call this first if you want `instructions` from a legacy server. The handshake
+    /// happens once per connection and carries them in its reply; a later `discover` has
+    /// only what this client kept, and instructions are not kept — they are unbounded, and
+    /// a `Client` owns no allocator to hold them in.
     pub fn discover(
         client: *Client,
         arena: std.mem.Allocator,
         options: CallOptions,
     ) Error!types.DiscoverResult {
+        if (client.era == .unknown) {
+            const negotiated = try client.negotiate(arena);
+            if (negotiated.initialized) |result| {
+                return client.era.legacy.discoverResult(
+                    arena,
+                    legacy_mod.instructionsOf(result),
+                );
+            }
+            // The probe was the request, so its answer is decoded here rather than asked
+            // for a second time.
+            const call = negotiated.discovered.?;
+            const result = call.result.?;
+            switch (try client.readResultType(types.method.discover, call.bytes, result)) {
+                .complete => {},
+                .input_required => return error.InputRequired,
+            }
+            return client.decodeResult(
+                types.DiscoverResult,
+                arena,
+                types.method.discover,
+                call.bytes,
+                result,
+            );
+        }
+        if (client.era == .legacy) {
+            // Handshaken on an earlier call. No round trip: `initialize` may be sent only
+            // once, and a server is entitled to refuse a second one.
+            return client.era.legacy.discoverResult(arena, null);
+        }
         return client.request(types.DiscoverResult, arena, types.method.discover, .none, options);
     }
 
@@ -1000,6 +1114,22 @@ pub const Client = struct {
         params: Params,
         options: CallOptions,
     ) Error!Call {
+        if (client.era == .unknown) _ = try client.negotiate(arena);
+        try client.checkMethodInEra(method);
+        return client.send(arena, method, params, options);
+    }
+
+    /// The exchange itself, with the era taken as settled.
+    ///
+    /// Split out because negotiation has to send requests of its own, and routing those
+    /// back through `exchange` would ask the era to be settled in order to settle it.
+    fn send(
+        client: *Client,
+        arena: std.mem.Allocator,
+        method: []const u8,
+        params: Params,
+        options: CallOptions,
+    ) Error!Call {
         const id = client.takeId();
         const bytes = try client.encodeRequest(arena, id, method, params, options);
 
@@ -1007,10 +1137,240 @@ pub const Client = struct {
         return client.awaitResponse(arena, id);
     }
 
+    /// Refuses a method the negotiated revision does not define.
+    fn checkMethodInEra(client: *const Client, method: []const u8) Error!void {
+        switch (client.era) {
+            .unknown, .modern => return,
+            .legacy => |*negotiated| {
+                if (legacy_mod.hasRequestMethod(method)) return;
+                client.report(
+                    "mcp: {s} does not exist in {s}, which is what this connection " ++
+                        "negotiated; it was added in {s}\n",
+                    .{ method, negotiated.negotiatedVersion(), types.protocol_version },
+                );
+                return error.UnsupportedByRevision;
+            },
+        }
+    }
+
+    /// What negotiation learned, and the reply that told it.
+    ///
+    /// Both replies borrow from the arena negotiation ran in, which is the arena of
+    /// whichever call triggered it. That is why `discover` is the one caller that reads
+    /// them: it is the call whose answer they are.
+    const Negotiation = struct {
+        /// The `server/discover` reply, when the probe found a modern server.
+        discovered: ?Call = null,
+        /// The `initialize` result, when the handshake ran.
+        initialized: ?std.json.Value = null,
+    };
+
+    /// Settles which era this connection speaks, by asking.
+    ///
+    /// The probe is `server/discover`, which is the modern era's own negotiation entry
+    /// point — so against a modern server this costs nothing extra, and its answer is the
+    /// answer `discover` wanted anyway.
+    ///
+    /// Any JSON-RPC error from the probe is read as "not a modern server", rather than
+    /// matching a code or a message. That is deliberate: the refusal differs by transport
+    /// and by implementation. Over stdio a 2025 server answers `-32601 Method not found`;
+    /// over Streamable HTTP it more often answers `400` with `-32000` because
+    /// `MCP-Protocol-Version: 2026-07-28` is a version it does not know, or because a
+    /// session it never opened is missing. Matching on any of that would be matching on
+    /// prose. A transport failure is *not* treated this way — a connection that broke says
+    /// nothing about which protocol was on it, so it propagates.
+    fn negotiate(client: *Client, arena: std.mem.Allocator) Error!Negotiation {
+        assert(client.era == .unknown);
+        assert(client.options.legacy == .negotiate);
+
+        // Encode the probe as modern, which is what it is testing for.
+        client.era = .modern;
+        const probe = client.send(arena, types.method.discover, .none, .{}) catch |err| {
+            client.era = .unknown;
+            return err;
+        };
+        if (probe.result != null) return .{ .discovered = probe };
+
+        client.report(
+            "mcp: server/discover was refused ([{d}] {s}); trying the {s} handshake\n",
+            .{
+                if (probe.failure) |failure| failure.code else 0,
+                if (probe.failure) |failure| failure.message else "no error object",
+                legacy_mod.version,
+            },
+        );
+
+        client.era = .unknown;
+        const result = try client.handshake(arena);
+        return .{ .initialized = result };
+    }
+
+    /// Performs the legacy `initialize` exchange and records what it agreed.
+    fn handshake(client: *Client, arena: std.mem.Allocator) Error!std.json.Value {
+        var params: std.Io.Writer.Allocating = .init(arena);
+        legacy_mod.writeInitializeParams(
+            &params.writer,
+            client.info,
+            client.options.capabilities,
+        ) catch return error.OutOfMemory;
+
+        // Encoded through the legacy envelope, which is why the era is set first: this
+        // request must carry no `_meta` at all, and `initialize` least of all — it is the
+        // one request whose params *are* the version and the capabilities.
+        client.era = .{ .legacy = .{} };
+        const call = client.send(
+            arena,
+            legacy_mod.method.initialize,
+            .{ .raw = params.written() },
+            .{},
+        ) catch |err| {
+            client.era = .unknown;
+            return err;
+        };
+
+        const result = call.result orelse {
+            client.era = .unknown;
+            client.report(
+                "mcp: the {s} handshake was refused too; this peer speaks neither " ++
+                    "revision this client knows\n",
+                .{legacy_mod.version},
+            );
+            return client.failureError(legacy_mod.method.initialize, call.failure);
+        };
+
+        client.era = .{ .legacy = legacy_mod.Handshake.fromResult(result) catch {
+            client.era = .unknown;
+            client.report(
+                "mcp: the {s} handshake answered with something that is not an " ++
+                    "InitializeResult: {s}\n",
+                .{ legacy_mod.version, preview(call.bytes) },
+            );
+            return error.UnexpectedResult;
+        } };
+
+        // The handshake is only complete once this is sent, and a conformant server may
+        // refuse everything until it arrives. It is a notification, so there is nothing
+        // to await and nothing to check — which is also why a server cannot tell this
+        // client that its confirmation was malformed.
+        try client.notify(arena, legacy_mod.method.initialized, null);
+
+        client.report(
+            "mcp: negotiated {s} through the legacy handshake\n",
+            .{client.era.legacy.negotiatedVersion()},
+        );
+        return result;
+    }
+
+    /// Sets the connection-wide log level, on a legacy connection.
+    ///
+    /// 2026-07-28 removed `logging/setLevel` and made the level a per-request `_meta`
+    /// field, which is why `CallOptions.log_level` exists and why it has no counterpart
+    /// here on a modern connection — asking for one would be asking a stateless protocol
+    /// to remember something.
+    ///
+    /// On a legacy connection the reverse holds: the level is connection state, so
+    /// `CallOptions.log_level` cannot be honoured per call and this is the only way to ask
+    /// for `notifications/message` at all.
+    pub fn setLogLevel(
+        client: *Client,
+        arena: std.mem.Allocator,
+        level: types.LoggingLevel,
+    ) Error!void {
+        if (client.era == .unknown) _ = try client.negotiate(arena);
+        if (client.era == .modern) {
+            client.report(
+                "mcp: logging/setLevel does not exist in {s}; ask per request with " ++
+                    "CallOptions.log_level\n",
+                .{types.protocol_version},
+            );
+            return error.UnsupportedByRevision;
+        }
+
+        var params: std.json.ObjectMap = .empty;
+        try params.put(arena, "level", .{ .string = @tagName(level) });
+        // `exchange` rather than `request`: the result is `{}`, so there is nothing to
+        // decode, and teaching the modern decode table about a method that exists only in
+        // the older era would put 2025 vocabulary where it does not belong.
+        const call = try client.send(
+            arena,
+            legacy_mod.method.set_level,
+            .{ .value = .{ .object = params } },
+            .{},
+        );
+        if (call.result == null) {
+            return client.failureError(legacy_mod.method.set_level, call.failure);
+        }
+    }
+
     fn takeId(client: *Client) jsonrpc.Id {
         const id = client.next_id;
         client.next_id += 1;
         return .{ .number = id };
+    }
+
+    /// Writes the `_meta` this era's requests carry, which on one era is nothing at all.
+    ///
+    /// The modern envelope is required on every request: the protocol is stateless, so
+    /// the version and the client's capabilities have nowhere else to live. The legacy era
+    /// established both once in the handshake, and repeating them per request would be
+    /// writing 2026 vocabulary onto a 2025 connection — which is the one thing the older
+    /// wire format must never see, because a server that validates its params strictly
+    /// rejects the request and one that does not may believe the wrong thing about the
+    /// peer.
+    ///
+    /// `progressToken` is the exception, and it spans both eras because it predates the
+    /// `io.modelcontextprotocol/` prefix convention and is spelled bare in each.
+    fn writeMeta(
+        client: *const Client,
+        members: *Members,
+        method: []const u8,
+        options: CallOptions,
+    ) Error!void {
+        switch (client.era) {
+            .unknown, .modern => {
+                try members.field("_meta", types.RequestMeta{
+                    .protocol_version = types.protocol_version,
+                    .capabilities = client.options.capabilities,
+                    .client_info = if (client.options.include_client_info) client.info else null,
+                    .log_level = options.log_level,
+                    .progress_token = options.progress_token,
+                    .extra = options.extra,
+                });
+            },
+            .legacy => {
+                if (options.log_level != null) {
+                    client.report(
+                        "mcp: {s} asked for log level per request, which {s} has no field " ++
+                            "for; call setLogLevel once instead\n",
+                        .{ method, client.era.legacy.negotiatedVersion() },
+                    );
+                }
+                // Omitted entirely when there is nothing to say, rather than sent empty:
+                // `_meta` is optional in this era, and `{}` is a different message from
+                // its absence to a server that counts keys.
+                if (options.progress_token == null and options.extra == null) return;
+
+                try members.separate();
+                members.writer.writeAll("\"_meta\":{") catch return error.OutOfMemory;
+                var inner: Members = .{ .writer = members.writer };
+                if (options.extra) |extra| {
+                    var iterator = extra.iterator();
+                    while (iterator.next()) |entry| {
+                        // Skipped for the same reason the modern envelope strips its own
+                        // reserved keys out of `extra`: two of the same key is not a
+                        // message either side can read.
+                        if (std.mem.eql(u8, entry.key_ptr.*, types.meta_key.progress_token)) {
+                            continue;
+                        }
+                        try inner.field(entry.key_ptr.*, entry.value_ptr.*);
+                    }
+                }
+                if (options.progress_token) |token| {
+                    try inner.field(types.meta_key.progress_token, token);
+                }
+                members.writer.writeAll("}") catch return error.OutOfMemory;
+            },
+        }
     }
 
     /// Builds the request envelope, injecting the `_meta` every request must carry.
@@ -1022,15 +1382,6 @@ pub const Client = struct {
         params: Params,
         options: CallOptions,
     ) Error![]const u8 {
-        const meta: types.RequestMeta = .{
-            .protocol_version = types.protocol_version,
-            .capabilities = client.options.capabilities,
-            .client_info = if (client.options.include_client_info) client.info else null,
-            .log_level = options.log_level,
-            .progress_token = options.progress_token,
-            .extra = options.extra,
-        };
-
         var out: std.Io.Writer.Allocating = .init(arena);
         const writer = &out.writer;
 
@@ -1043,7 +1394,7 @@ pub const Client = struct {
         // that take no arguments of their own.
         writer.writeAll(",\"params\":{") catch return error.OutOfMemory;
         var members: Members = .{ .writer = writer };
-        try members.field("_meta", meta);
+        try client.writeMeta(&members, method, options);
 
         switch (params) {
             .none => {},
@@ -2851,4 +3202,275 @@ test "the non-interactive path still reports that input was required" {
         error.InputRequired,
         fixture.client.callTool(fixture.allocator(), "x", null, .{}),
     );
+}
+
+// ---------------------------------------------------------------------------
+// Falling back to the 2025 protocol
+// ---------------------------------------------------------------------------
+
+/// What a pre-2026-07-28 server answers `server/discover` with over stdio. The refusal
+/// differs per transport, which is why negotiation matches on none of it.
+const discover_not_found =
+    \\{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}
+;
+
+/// A 2025 `InitializeResult`. No `resultType`, no cache fields — the era has neither.
+const initialize_ok =
+    \\{"jsonrpc":"2.0","id":2,"result":{"protocolVersion":"2025-11-25",
+    \\ "capabilities":{"tools":{},"logging":{}},
+    \\ "serverInfo":{"name":"legacy-server","version":"0.9"},
+    \\ "instructions":"call add for arithmetic"}}
+;
+
+test "the default refuses to fall back, and sends no probe" {
+    var fixture: Fixture = undefined;
+    fixture.init(&.{discover_not_found}, .{});
+    defer fixture.deinit();
+
+    // `.reject` is the default, so the era is settled before anything is sent: one
+    // request goes out, it is the caller's, and its failure is reported as-is.
+    try testing.expectError(
+        error.RequestFailed,
+        fixture.client.discover(fixture.allocator(), .{}),
+    );
+    try testing.expectEqual(@as(usize, 1), fixture.transport.sent.items.len);
+    try testing.expectEqualStrings("2026-07-28", fixture.client.negotiatedVersion().?);
+}
+
+test "negotiate falls back to the handshake when discover is not found" {
+    var fixture: Fixture = undefined;
+    fixture.init(&.{ discover_not_found, initialize_ok }, .{ .legacy = .negotiate });
+    defer fixture.deinit();
+
+    const discovered = try fixture.client.discover(fixture.allocator(), .{});
+
+    // The answer reads like a modern one, which is the point: a caller does not branch.
+    try testing.expectEqual(@as(usize, 1), discovered.supportedVersions.len);
+    try testing.expectEqualStrings("2025-11-25", discovered.supportedVersions[0]);
+    try testing.expect(discovered.capabilities.tools != null);
+    try testing.expect(discovered.capabilities.logging != null);
+    try testing.expect(discovered.capabilities.prompts == null);
+    try testing.expectEqualStrings("call add for arithmetic", discovered.instructions.?);
+    try testing.expectEqualStrings("2025-11-25", fixture.client.negotiatedVersion().?);
+
+    // The reported version must point into the client's own storage. Comparing the bytes
+    // does not establish that: the first version of `negotiatedVersion` captured the
+    // handshake by value and returned a slice into the switch's temporary, which still
+    // read as "2025-11-25" here and as binary noise in a diagnostic two frames later.
+    const reported = fixture.client.negotiatedVersion().?;
+    const base = @intFromPtr(&fixture.client);
+    try testing.expect(@intFromPtr(reported.ptr) >= base);
+    try testing.expect(@intFromPtr(reported.ptr) + reported.len <= base + @sizeOf(Client));
+
+    // Three messages: the probe, the handshake, and the confirmation the handshake is
+    // only complete with.
+    const sent = fixture.transport.sent.items;
+    try testing.expectEqual(@as(usize, 3), sent.len);
+    try testing.expect(std.mem.indexOf(u8, sent[0], "\"server/discover\"") != null);
+    try testing.expect(std.mem.indexOf(u8, sent[1], "\"initialize\"") != null);
+    try testing.expect(std.mem.indexOf(u8, sent[2], "\"notifications/initialized\"") != null);
+}
+
+test "the initialize request carries no 2026 vocabulary" {
+    var fixture: Fixture = undefined;
+    fixture.init(&.{ discover_not_found, initialize_ok }, .{ .legacy = .negotiate });
+    defer fixture.deinit();
+
+    _ = try fixture.client.discover(fixture.allocator(), .{});
+
+    const initialize = fixture.transport.sent.items[1];
+    const parsed = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        fixture.allocator(),
+        initialize,
+        .{},
+    );
+    const params = parsed.object.get("params").?.object;
+
+    // The version and capabilities are params members here, not `_meta` keys, and there
+    // is no `_meta` at all. This is the never-stamp rule: one 2026 key on this request
+    // and a strict 2025 server rejects it.
+    try testing.expectEqualStrings("2025-11-25", params.get("protocolVersion").?.string);
+    try testing.expect(params.get("capabilities") != null);
+    try testing.expectEqualStrings("test-client", params.get("clientInfo").?.object.get("name").?.string);
+    try testing.expect(params.get("_meta") == null);
+    try testing.expect(std.mem.indexOf(u8, initialize, "io.modelcontextprotocol/") == null);
+    try testing.expect(std.mem.indexOf(u8, initialize, "2026-07-28") == null);
+}
+
+test "requests on a legacy connection carry no envelope either" {
+    var fixture: Fixture = undefined;
+    fixture.init(&.{
+        discover_not_found,
+        initialize_ok,
+        // No `resultType`, which a 2025 server does not send and this client reads as
+        // `complete` — the specification's own rule for exactly this direction.
+        \\{"jsonrpc":"2.0","id":3,"result":{"tools":[{"name":"add","inputSchema":{}}]}}
+        ,
+    }, .{ .legacy = .negotiate });
+    defer fixture.deinit();
+
+    const listed = try fixture.client.listTools(fixture.allocator(), .{});
+    try testing.expectEqual(@as(usize, 1), listed.tools.len);
+    try testing.expectEqualStrings("add", listed.tools[0].name);
+
+    // Index 3: the probe, the handshake and its confirmation come first.
+    const request = fixture.transport.sent.items[3];
+    try testing.expect(std.mem.indexOf(u8, request, "\"tools/list\"") != null);
+    try testing.expect(std.mem.indexOf(u8, request, "_meta") == null);
+    try testing.expect(std.mem.indexOf(u8, request, "io.modelcontextprotocol/") == null);
+}
+
+test "a progress token still travels on a legacy connection" {
+    var fixture: Fixture = undefined;
+    fixture.init(&.{
+        discover_not_found,
+        initialize_ok,
+        \\{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}]}}
+        ,
+    }, .{ .legacy = .negotiate });
+    defer fixture.deinit();
+
+    _ = try fixture.client.callTool(fixture.allocator(), "add", null, .{
+        .progress_token = .{ .string = "p-1" },
+        // Per-request log level has no field in this era. It is reported and dropped
+        // rather than invented into `logging/setLevel` behind the caller's back.
+        .log_level = .debug,
+    });
+
+    const request = fixture.transport.sent.items[3];
+    const parsed = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        fixture.allocator(),
+        request,
+        .{},
+    );
+    const meta = parsed.object.get("params").?.object.get("_meta").?.object;
+    // `progressToken` is the one key both eras spell the same, because it predates the
+    // prefix convention.
+    try testing.expectEqualStrings("p-1", meta.get("progressToken").?.string);
+    try testing.expectEqual(@as(usize, 1), meta.count());
+}
+
+test "a method the negotiated revision lacks is refused without being sent" {
+    var fixture: Fixture = undefined;
+    fixture.init(&.{ discover_not_found, initialize_ok }, .{ .legacy = .negotiate });
+    defer fixture.deinit();
+
+    _ = try fixture.client.discover(fixture.allocator(), .{});
+    const before = fixture.transport.sent.items.len;
+
+    // `subscriptions/listen` replaced `resources/subscribe` in 2026-07-28. Sending it
+    // would earn a `-32601`, which reads as a server missing a feature rather than a
+    // connection that cannot express one.
+    try testing.expectError(error.UnsupportedByRevision, fixture.client.exchange(
+        fixture.allocator(),
+        types.method.subscriptions_listen,
+        .none,
+        .{},
+    ));
+    try testing.expectEqual(before, fixture.transport.sent.items.len);
+}
+
+test "discover after the handshake costs no round trip" {
+    var fixture: Fixture = undefined;
+    fixture.init(&.{
+        discover_not_found,
+        initialize_ok,
+        \\{"jsonrpc":"2.0","id":3,"result":{"tools":[]}}
+        ,
+    }, .{ .legacy = .negotiate });
+    defer fixture.deinit();
+
+    _ = try fixture.client.listTools(fixture.allocator(), .{});
+    const before = fixture.transport.sent.items.len;
+
+    // `initialize` may be sent once per connection, so this is answered from what the
+    // handshake established. Everything but `instructions`, which is not kept.
+    const discovered = try fixture.client.discover(fixture.allocator(), .{});
+    try testing.expectEqual(before, fixture.transport.sent.items.len);
+    try testing.expectEqualStrings("2025-11-25", discovered.supportedVersions[0]);
+    try testing.expect(discovered.capabilities.tools != null);
+    try testing.expect(discovered.instructions == null);
+}
+
+test "a modern server is not made to pay for the fallback" {
+    var fixture: Fixture = undefined;
+    fixture.init(&.{
+        \\{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","ttlMs":0,
+        \\ "cacheScope":"private","supportedVersions":["2026-07-28"],"capabilities":{}}}
+    }, .{ .legacy = .negotiate });
+    defer fixture.deinit();
+
+    // The probe *is* the discover request, so a modern server sees exactly one message
+    // and the answer is its own.
+    const discovered = try fixture.client.discover(fixture.allocator(), .{});
+    try testing.expectEqual(@as(usize, 1), fixture.transport.sent.items.len);
+    try testing.expectEqualStrings("2026-07-28", discovered.supportedVersions[0]);
+    try testing.expectEqualStrings("2026-07-28", fixture.client.negotiatedVersion().?);
+}
+
+test "a peer that refuses both revisions reports the handshake's failure" {
+    var fixture: Fixture = undefined;
+    fixture.init(&.{
+        discover_not_found,
+        \\{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}
+        ,
+    }, .{ .legacy = .negotiate });
+    defer fixture.deinit();
+
+    try testing.expectError(
+        error.RequestFailed,
+        fixture.client.listTools(fixture.allocator(), .{}),
+    );
+    // The era stays unsettled, so a later call tries again rather than committing to a
+    // guess about a peer that answered nothing.
+    try testing.expect(fixture.client.negotiatedVersion() == null);
+}
+
+test "a transport failure during the probe is not read as a legacy server" {
+    var fixture: Fixture = undefined;
+    // Nothing scripted: the transport ends the exchange without answering.
+    fixture.init(&.{}, .{ .legacy = .negotiate });
+    defer fixture.deinit();
+
+    // A connection that broke says nothing about which protocol was on it, so no
+    // handshake is attempted and the era stays unknown.
+    try testing.expectError(
+        error.NoResponse,
+        fixture.client.listTools(fixture.allocator(), .{}),
+    );
+    try testing.expectEqual(@as(usize, 1), fixture.transport.sent.items.len);
+    try testing.expect(fixture.client.negotiatedVersion() == null);
+}
+
+test "setLogLevel is the legacy way in, and refused on a modern connection" {
+    {
+        var fixture: Fixture = undefined;
+        fixture.init(&.{
+            discover_not_found,
+            initialize_ok,
+            \\{"jsonrpc":"2.0","id":3,"result":{}}
+            ,
+        }, .{ .legacy = .negotiate });
+        defer fixture.deinit();
+
+        try fixture.client.setLogLevel(fixture.allocator(), .debug);
+        const sent = fixture.transport.sent.items[3];
+        try testing.expect(std.mem.indexOf(u8, sent, "\"logging/setLevel\"") != null);
+        try testing.expect(std.mem.indexOf(u8, sent, "\"level\":\"debug\"") != null);
+    }
+    {
+        var fixture: Fixture = undefined;
+        fixture.init(&.{}, .{});
+        defer fixture.deinit();
+
+        // 2026-07-28 removed the method: the level is per-request `_meta` there, and
+        // asking a stateless protocol to remember one is the mistake this names.
+        try testing.expectError(
+            error.UnsupportedByRevision,
+            fixture.client.setLogLevel(fixture.allocator(), .debug),
+        );
+        try testing.expectEqual(@as(usize, 0), fixture.transport.sent.items.len);
+    }
 }

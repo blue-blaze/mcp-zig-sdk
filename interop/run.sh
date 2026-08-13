@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # Runs the full interoperability matrix against the official TypeScript SDK.
 #
-# Four legs, because a bug on either side of the wire shows up in only one direction:
+# Five legs, because a bug on either side of the wire shows up in only one direction:
 #
 #   1. TS client   -> this SDK's server   over Streamable HTTP
 #   2. TS client   -> this SDK's server   over stdio
 #   3. this client -> TS SDK's server     over Streamable HTTP
 #   4. this client -> TS SDK's server     over stdio
+#   5. this client -> TS SDK's *2025* server, over stdio
 #
-# Both TS servers are started with `legacy: 'reject'` and both TS clients pin
-# 2026-07-28, so a leg cannot pass by quietly falling back to the 2025 protocol.
+# Legs 1-4 run the TS servers with `legacy: 'reject'` and pin both TS clients to
+# 2026-07-28, so none of them can pass by quietly falling back to the older protocol.
+# Leg 5 is the opposite experiment and needs both halves to mean anything: a server that
+# speaks only 2025, and a client that was told it may negotiate. Same `buildServer` as
+# the others, so any difference in the results is the protocol era and nothing else.
 #
 # Usage: interop/run.sh          (from the repository root or anywhere)
 
@@ -108,6 +112,13 @@ echo "leg 4: this SDK's client -> TypeScript server (stdio)"
 echo "=============================================================="
 ./zig-out/bin/interop-check stdio node interop/ts-server-stdio.mjs
 record "Zig client -> TS server (stdio)" $?
+
+echo
+echo "=============================================================="
+echo "leg 5: this SDK's client -> TypeScript 2025 server (stdio)"
+echo "=============================================================="
+./zig-out/bin/interop-check legacy node interop/legacy-server-stdio.mjs
+record "Zig client -> TS 2025 server (stdio, negotiated)" $?
 
 echo
 echo "=============================================================="

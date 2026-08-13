@@ -34,6 +34,7 @@ pub const context = @import("context.zig");
 pub const registry = @import("registry.zig");
 pub const server = @import("server.zig");
 pub const client = @import("client.zig");
+pub const legacy = @import("legacy.zig");
 pub const request_state = @import("request_state.zig");
 pub const subscriptions = @import("subscriptions.zig");
 pub const stdio = @import("stdio.zig");

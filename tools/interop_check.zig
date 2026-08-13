@@ -88,6 +88,8 @@ pub fn main(init: std.process.Init) !void {
         try runHttp(gpa, io, argv.items[0]);
     } else if (std.mem.eql(u8, mode, "stdio")) {
         try runStdio(gpa, io, argv.items);
+    } else if (std.mem.eql(u8, mode, "legacy")) {
+        try runLegacy(gpa, io, argv.items);
     } else {
         return error.UnknownMode;
     }
@@ -140,6 +142,140 @@ fn runStdio(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void 
     // `Mcp-Param-*` is an HTTP concept, so stdio skips the header-mirroring checks by
     // passing no learned mappings.
     try runChecks(gpa, &client, &recorder, null);
+}
+
+/// This SDK's client against a server that speaks only the 2025 protocol.
+///
+/// A separate set of checks rather than `runChecks` with branches, because the two eras
+/// genuinely disagree about what exists: there is no `server/discover` to answer, no cache
+/// hint to carry, no per-request log level, and no `subscriptions/listen`. Asserting the
+/// modern list with exceptions carved out would hide which of those is which.
+fn runLegacy(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
+    var recorder: Recorder = .{ .gpa = gpa };
+    defer recorder.deinit();
+
+    var input_buffer: [64 * 1024]u8 = undefined;
+    var output_buffer: [64 * 1024]u8 = undefined;
+    var child: mcp.stdio.ChildServer = try .spawn(io, argv, &input_buffer, &output_buffer, .{});
+    defer _ = child.shutdown();
+
+    var client: mcp.Client = .init(child.transport(), .{
+        .name = "mcp-zig-sdk-interop",
+        .version = "0.1.0",
+    }, .{
+        .observer = recorder.observer(),
+        // The whole point of this leg. Without it the first request fails, which is what
+        // every other leg in this matrix asserts.
+        .legacy = .negotiate,
+    });
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // ---- negotiation ----
+    // `discover` is answered from the handshake here: the probe earns a -32601, the
+    // client sends `initialize`, and the InitializeResult is reported in the shape a
+    // modern `server/discover` would have used.
+    const discovered = try client.discover(arena, .{});
+    const negotiated = client.negotiatedVersion() orelse "(none)";
+    check(
+        "negotiated a pre-2026 revision",
+        !mcp.legacy.isModern(negotiated),
+        negotiated,
+    );
+    check(
+        "the handshake is reported as a discover result",
+        discovered.supportedVersions.len == 1 and
+            std.mem.eql(u8, discovered.supportedVersions[0], negotiated),
+        discovered.supportedVersions[0],
+    );
+    check(
+        "capabilities came through the handshake",
+        discovered.capabilities.tools != null,
+        if (discovered.capabilities.tools != null) "tools declared" else "(none)",
+    );
+
+    // ---- the methods both eras share ----
+    // A 2025 server sends no `resultType` and no cache hint, so each of these also
+    // exercises reading an absent one as `complete` rather than as malformed.
+    const tools = try client.listTools(arena, .{});
+    var has_add = false;
+    for (tools.tools) |tool| {
+        if (std.mem.eql(u8, tool.name, "add")) has_add = true;
+    }
+    check("tools/list on a legacy connection", has_add, try nameList(arena, tools.tools));
+
+    var add_args: std.json.ObjectMap = .empty;
+    try add_args.put(arena, "a", .{ .integer = 17 });
+    try add_args.put(arena, "b", .{ .integer = 25 });
+    const sum = try client.callTool(arena, "add", .{ .object = add_args }, .{});
+    check(
+        "tools/call on a legacy connection",
+        textOf(sum) != null and std.mem.eql(u8, textOf(sum).?, "42"),
+        textOf(sum) orelse "(none)",
+    );
+
+    const read = try client.readResource(arena, "file:///ts-readme.md", .{});
+    const body = switch (read.contents[0]) {
+        .text => |text| text.text,
+        .blob => "(blob)",
+    };
+    check(
+        "resources/read on a legacy connection",
+        std.mem.indexOf(u8, body, "TypeScript SDK") != null,
+        body,
+    );
+
+    var prompt_args: std.json.ObjectMap = .empty;
+    try prompt_args.put(arena, "who", .{ .string = "Ada" });
+    const prompt = try client.getPrompt(arena, "greet", .{ .object = prompt_args }, .{});
+    const message = switch (prompt.messages[0].content) {
+        .text => |text| text.text,
+        else => "(not text)",
+    };
+    check(
+        "prompts/get on a legacy connection",
+        std.mem.indexOf(u8, message, "Ada") != null,
+        message,
+    );
+
+    // ---- progress, which is the one `_meta` key both eras spell the same ----
+    recorder.progress.clearRetainingCapacity();
+    var count_args: std.json.ObjectMap = .empty;
+    try count_args.put(arena, "to", .{ .integer = 3 });
+    const counted = try client.callTool(arena, "count", .{ .object = count_args }, .{
+        .progress_token = .{ .number = 7 },
+    });
+    check(
+        "tools/call reporting progress on a legacy connection",
+        textOf(counted) != null and std.mem.eql(u8, textOf(counted).?, "1 2 3"),
+        textOf(counted) orelse "(none)",
+    );
+    // The count is not asserted: the TypeScript client drops progress over stdio and this
+    // one does not, but the leg that pins the exact number is the HTTP one, where each
+    // notification is its own SSE event. What matters here is that the bare
+    // `progressToken` was understood at all by a server on the older revision.
+    check(
+        "progressToken understood across the era boundary",
+        recorder.progress.items.len >= 1,
+        try std.fmt.allocPrint(arena, "{d} notifications", .{recorder.progress.items.len}),
+    );
+
+    // ---- what the era cannot carry ----
+    // Refused locally, before anything is sent. A -32601 from the server would read as a
+    // missing feature; this says the connection cannot express it.
+    const refused = client.exchange(
+        arena,
+        mcp.types.method.subscriptions_listen,
+        .none,
+        .{},
+    );
+    check(
+        "subscriptions/listen refused as absent from the revision",
+        refused == error.UnsupportedByRevision,
+        if (refused) |_| "(accepted)" else |err| @errorName(err),
+    );
 }
 
 fn runChecks(

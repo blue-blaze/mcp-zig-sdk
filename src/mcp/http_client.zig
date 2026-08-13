@@ -334,6 +334,11 @@ pub const Transport = struct {
     exchange: ?*Exchange = null,
     /// Set when the request was accepted with no body to read.
     accepted: bool = false,
+    /// The `Mcp-Session-Id` a pre-2026-07-28 server assigned, owned by this transport.
+    ///
+    /// Null against a 2026-07-28 server, which has no sessions — the revision removed them
+    /// along with the handshake. See `rememberSession`.
+    session_id: ?[]const u8 = null,
     /// What the server said when it last refused on authorization grounds.
     ///
     /// Recorded here rather than returned from `send`, because the value it points at
@@ -381,6 +386,7 @@ pub const Transport = struct {
     pub fn deinit(self: *Transport) void {
         self.finish();
         self.clearChallenge();
+        self.clearSession();
     }
 
     /// The recorded challenge, copied into `arena`.
@@ -406,6 +412,33 @@ pub const Transport = struct {
         const previous = self.challenge orelse return;
         if (previous.header) |header_value| self.gpa.free(header_value);
         self.challenge = null;
+    }
+
+    /// Records the session a pre-2026-07-28 server assigned, so later requests carry it.
+    ///
+    /// Done at the header layer, from a response header to a request header, without the
+    /// body being looked at — which is what keeps this file free of protocol semantics. The
+    /// transport does not need to know that the response it just read was an
+    /// `InitializeResult`, only that the server named a session; and the reverse is true of
+    /// the client, which never has to learn that this transport has sessions at all.
+    ///
+    /// The first one wins for the connection's lifetime. A server re-issuing a different
+    /// id mid-connection is not a case the older revisions define, and adopting the new
+    /// one would silently abandon in-flight state the old one owned.
+    fn rememberSession(self: *Transport, assigned: ?[]const u8) Error!void {
+        const value = assigned orelse return;
+        if (self.session_id != null) return;
+        self.session_id = try self.gpa.dupe(u8, value);
+        self.report("adopted session {s}; this peer is on a pre-{s} revision\n", .{
+            value,
+            types.protocol_version,
+        });
+    }
+
+    fn clearSession(self: *Transport) void {
+        const previous = self.session_id orelse return;
+        self.gpa.free(previous);
+        self.session_id = null;
     }
 
     pub fn transport(self: *Transport) client_mod.Transport {
@@ -473,6 +506,7 @@ pub const Transport = struct {
 
         try exchange.writeRequest(message, headers);
         try exchange.readHead(arena, self.options.response_bytes_max);
+        try self.rememberSession(exchange.response.session_id);
 
         // An authorization refusal is reported as its own error rather than delivered
         // as a body, because there is no body: the status and the challenge are the
@@ -541,6 +575,11 @@ pub const Transport = struct {
         var list: std.ArrayListUnmanaged(Header) = .empty;
         try list.append(arena, .{ .name = http.header.content_type, .value = "application/json" });
         try list.append(arena, .{ .name = http.header.accept, .value = accept_value });
+        // Before the caller's own headers, so a caller that sets one by hand overrides
+        // rather than duplicates.
+        if (self.session_id) |value| {
+            try list.append(arena, .{ .name = http.header.session_id, .value = value });
+        }
         for (self.options.extra_headers) |entry| try list.append(arena, entry);
         if (self.options.header_source) |source| {
             for (try source.get(arena)) |entry| try list.append(arena, entry);
@@ -912,6 +951,11 @@ pub const Response = struct {
     /// the operation needs. Allocated in the head arena, so a caller that outlives the
     /// arena has to copy it — `Transport` does.
     challenge: ?[]const u8,
+    /// The `Mcp-Session-Id` the server assigned, when it sent one.
+    ///
+    /// Only a pre-2026-07-28 server does. Same lifetime as `challenge` — the head arena —
+    /// so `Transport` copies it before that arena goes.
+    session_id: ?[]const u8,
     /// True when the body is `text/event-stream`.
     streaming: bool,
     /// Set once the body has been fully delivered.
@@ -934,6 +978,7 @@ pub const Response = struct {
         var chunked = false;
         var streaming = false;
         var challenge: ?[]const u8 = null;
+        var session_id: ?[]const u8 = null;
 
         // Each line is bounded, but a head made of nothing but lines was not: the loop
         // ended when the server chose to send its blank line, and every header until then
@@ -965,6 +1010,11 @@ pub const Response = struct {
                 // First one wins. A response with two is malformed, and preferring the
                 // later copy would let an appended header override the real one.
                 if (challenge == null) challenge = value;
+            } else if (std.ascii.eqlIgnoreCase(name, http.header.session_id)) {
+                // Same rule, and it matters more here: a later copy overriding the real
+                // session would point every subsequent request at a session the server
+                // never opened.
+                if (session_id == null and value.len > 0) session_id = value;
             }
         }
 
@@ -981,6 +1031,7 @@ pub const Response = struct {
         return .{
             .status = status,
             .challenge = challenge,
+            .session_id = session_id,
             .streaming = streaming,
             .spent = framing == .length and framing.length == 0,
             .body = .init(source, framing),
@@ -1960,6 +2011,67 @@ test "the first WWW-Authenticate wins" {
     try testing.expect(
         std.mem.indexOf(u8, response.challenge.?, "insufficient_scope") != null,
     );
+}
+
+test "a session a legacy server assigns is read off the head and echoed back" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var source: std.Io.Reader = .fixed(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Mcp-Session-Id: sess-42\r\n" ++
+            // A second copy must not displace the first: pointing later requests at a
+            // session the server never opened is a 400 on every one of them.
+            "Mcp-Session-Id: sess-other\r\n" ++
+            "Content-Length: 0\r\n\r\n",
+    );
+    const response = try Response.read(&source, gpa, jsonrpc.message_size_max);
+    try testing.expectEqualStrings("sess-42", response.session_id.?);
+
+    // And once remembered, every request carries it. The transport never parses a body to
+    // learn this — the id came from a header and goes back out as one.
+    var owner: Transport = .init(testing.allocator, undefined, "http://localhost/mcp", .{});
+    defer owner.deinit();
+    try owner.rememberSession(response.session_id);
+    const headers = try owner.headersFor(
+        gpa,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}",
+    );
+    try testing.expectEqualStrings("sess-42", headerValue(headers, "Mcp-Session-Id").?);
+
+    // The first assignment holds for the connection's lifetime.
+    try owner.rememberSession("sess-99");
+    try testing.expectEqualStrings("sess-42", owner.session_id.?);
+}
+
+test "a modern exchange carries no session header and needs none" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    // 2026-07-28 removed sessions with the handshake, so there is nothing to echo and
+    // nothing to remember. The header must not appear on its own.
+    const headers = try headersOf(
+        arena.allocator(),
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{" ++
+            request_meta ++ "}}",
+        .{},
+    );
+    try testing.expect(headerValue(headers, "Mcp-Session-Id") == null);
+    // The version header, by contrast, is derived from the body's `_meta`. That is what
+    // keeps it correct on a legacy connection without the transport knowing about eras: a
+    // legacy request carries no `_meta`, so no version header goes out — and an absent one
+    // is what a pre-2026 server tolerates, where `2026-07-28` is a `400`.
+    try testing.expectEqualStrings(
+        "2026-07-28",
+        headerValue(headers, "MCP-Protocol-Version").?,
+    );
+    const legacy_shaped = try headersOf(
+        arena.allocator(),
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}",
+        .{},
+    );
+    try testing.expect(headerValue(legacy_shaped, "MCP-Protocol-Version") == null);
 }
 
 test "a response with no challenge reports none rather than an empty one" {

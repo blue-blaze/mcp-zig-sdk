@@ -55,6 +55,13 @@ pub const header = struct {
     pub const origin = "Origin";
     pub const authorization = "Authorization";
     pub const www_authenticate = "WWW-Authenticate";
+    /// Pre-2026-07-28 only, and named here because the client transport has to echo it.
+    ///
+    /// The older revisions made a Streamable HTTP connection stateful: the server assigns
+    /// a session on `initialize` and every later request must carry it back, or be refused
+    /// with a `400`. 2026-07-28 removed sessions along with the handshake, so a modern
+    /// server never sends this and a modern client never has one to send.
+    pub const session_id = "Mcp-Session-Id";
 };
 
 /// The marker wrapping a Base64-encoded header value.
