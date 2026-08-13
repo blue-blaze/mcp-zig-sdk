@@ -49,6 +49,9 @@ pub const Parts = struct {
     /// is forbidden before the comparisons this stack performs.
     port: ?u16,
     /// Path including the leading `/`, or empty when the URL had none.
+    ///
+    /// Free of `.` and `..` segments: `parse` refuses those rather than resolving them,
+    /// so a path spliced into a well-known URL cannot mean somewhere else.
     path: []const u8,
     query: ?[]const u8,
     fragment: ?[]const u8,
@@ -153,6 +156,14 @@ pub fn parse(url: []const u8) Error!Parts {
     // is the only outcome that cannot surprise.
     if (std.mem.indexOfScalar(u8, authority, '@') != null) return error.InvalidUrl;
 
+    // Dot segments are refused for the same reason, and it matters most in the
+    // well-known builders: they splice this path into a URL either after or before
+    // `/.well-known/<suffix>`, and an issuer of `https://as.example.com/a/../..` would
+    // produce a URL that resolves back out of the prefix the rules put it in. Since
+    // comparison in this stack is byte-exact and deliberately unnormalized, a path that
+    // means something different once resolved is a path this module must not carry.
+    if (hasDotSegment(path)) return error.InvalidUrl;
+
     var host = authority;
     var port: ?u16 = null;
     if (authority[0] == '[') {
@@ -186,6 +197,42 @@ pub fn parse(url: []const u8) Error!Parts {
         .query = query,
         .fragment = fragment,
     };
+}
+
+/// True when any segment of `path` is `.` or `..`.
+fn hasDotSegment(path: []const u8) bool {
+    var segments = std.mem.splitScalar(u8, path, '/');
+    while (segments.next()) |segment| {
+        if (isDotSegment(segment)) return true;
+    }
+    return false;
+}
+
+/// True for a segment of one or two dots, each written literally or as `%2e`.
+///
+/// The encoded forms are included because the question is what a server will do with
+/// the URL, not what RFC 3986 says it means. The RFC is clear that `%2e%2e` is an
+/// ordinary segment and must not be resolved as a parent reference — and
+/// implementations decode first anyway, often enough that treating the encoded form as
+/// safe would be trusting the least reliable part of the stack. Three or more dots is a
+/// legal ordinary name and stays allowed.
+fn isDotSegment(segment: []const u8) bool {
+    var dots: usize = 0;
+    var index: usize = 0;
+    while (index < segment.len) {
+        if (segment[index] == '.') {
+            index += 1;
+        } else if (index + 3 <= segment.len and segment[index] == '%' and
+            std.ascii.eqlIgnoreCase(segment[index + 1 .. index + 3], "2e"))
+        {
+            index += 3;
+        } else {
+            return false;
+        }
+        dots += 1;
+        if (dots > 2) return false;
+    }
+    return dots > 0;
 }
 
 /// The default port for a scheme.
@@ -401,6 +448,38 @@ test "pathComponent strips trailing slashes and reports emptiness" {
 
     try std.testing.expect((try parse("https://a.example/tenant1")).hasPathComponent());
     try std.testing.expect(!(try parse("https://a.example/")).hasPathComponent());
+}
+
+test "a dot segment is refused rather than resolved" {
+    // The attack this closes: an issuer whose path climbs back out of the
+    // `/.well-known/<suffix>` prefix the discovery rules put it behind.
+    try std.testing.expectError(error.InvalidUrl, parse("https://a.example/tenant1/../.."));
+    try std.testing.expectError(error.InvalidUrl, parse("https://a.example/../etc"));
+    try std.testing.expectError(error.InvalidUrl, parse("https://a.example/./a"));
+    try std.testing.expectError(error.InvalidUrl, parse("https://a.example/a/.."));
+    try std.testing.expectError(error.InvalidUrl, parse("https://a.example/.."));
+    try std.testing.expectError(error.InvalidUrl, parse("https://a.example/."));
+
+    // Percent-encoded, in both cases, and in mixed case. RFC 3986 says these are
+    // ordinary segments; enough servers decode before resolving that relying on that
+    // would be trusting the wrong layer.
+    try std.testing.expectError(error.InvalidUrl, parse("https://a.example/%2e%2e/x"));
+    try std.testing.expectError(error.InvalidUrl, parse("https://a.example/%2E%2E/x"));
+    try std.testing.expectError(error.InvalidUrl, parse("https://a.example/.%2e/x"));
+    try std.testing.expectError(error.InvalidUrl, parse("https://a.example/%2e/x"));
+
+    // A query or fragment is split off before the path, so neither can smuggle one in
+    // and neither is affected by the rule.
+    _ = try parse("https://a.example/tenant?next=../admin");
+    _ = try parse("https://a.example/tenant#../admin");
+
+    // Names that merely contain or resemble dots stay legal. `...` is an ordinary
+    // segment, and refusing it would be a rule about dots rather than about traversal.
+    _ = try parse("https://a.example/...");
+    _ = try parse("https://a.example/..a");
+    _ = try parse("https://a.example/a..b");
+    _ = try parse("https://a.example/a.b/c");
+    _ = try parse("https://a.example/%2ea");
 }
 
 test "isLoopback covers the forms a redirect URI may use" {
