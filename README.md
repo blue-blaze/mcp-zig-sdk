@@ -230,6 +230,15 @@ so there are no `defer free`s in handler code and no way for a handler to outliv
 allocations. Long-lived state — the registry, the subscription broker, the transport
 itself — takes a general allocator from the application and is torn down by it.
 
+The registry borrows every string in a definition and copies none of them, so a name,
+description or raw schema passed to `addTool` at runtime has to stay valid for as long as
+the entry is registered — `removeTool` and `deinit` free nothing they pointed at. Comptime
+registration is unaffected, since those strings are literals. There is also no lock inside
+the registry: mutating it while requests are being served is a data race the application
+has to serialize, and a `*const ToolDefinition` from `findTool` dies at the next mutation.
+Registering everything before serving needs none of that, which is why the plain path has
+no lock in it.
+
 Everything with a per-peer cost is a fixed-size table rather than a growing container, so
 a peer cannot enlarge the server: 4096 registry entries, 256 subscribers, 64 subscribed
 URIs each, 64 queued notifications each (identical ones coalesce), 1024 cancellable

@@ -430,9 +430,40 @@ fn translate(err: anyerror) Error {
 // Registry
 // ---------------------------------------------------------------------------
 
-/// What a server offers. Not thread-safe on its own: the server owns the lock,
-/// because a mutation has to be visible atomically alongside the `list_changed`
-/// notification it triggers.
+/// What a server offers.
+///
+/// ## Every string is borrowed
+///
+/// A definition is stored by value and its slices are not copied. `deinit` frees the
+/// four lists and nothing they point at, and `removeTool` and its siblings free nothing
+/// at all — so every name, title, description, URI template and raw schema must stay
+/// valid for as long as the entry is registered.
+///
+/// For a comptime registration that is automatic: the strings are literals with static
+/// lifetime. It is `addTool` and friends where it matters, and the failure is quiet — a
+/// name built in an arena that is then released leaves the registry pointing at freed
+/// bytes, and the first symptom is a `tools/list` with garbage in it rather than a crash
+/// at the mistake. Copying is not done here because the registry cannot know which
+/// strings are already static, and duplicating a comptime schema into the heap would give
+/// up the property the comptime path exists for.
+///
+/// ## No internal synchronization
+///
+/// There is no lock in here, and the server does not add one: it holds a `*Registry` and
+/// reads it directly on whatever thread is serving the request. Two consequences a
+/// long-running server has to design around:
+///
+/// * **A mutation concurrent with a request is a data race.** `addTool` may reallocate
+///   and shifts entries to keep them sorted, so a `tools/list` running beside it can read
+///   a half-moved array. Mutating while serving needs a lock the application owns, held
+///   across both the mutation and every dispatch — which is why `Server` takes a mutable
+///   pointer rather than pretending the registry is immutable.
+/// * **A `*const ToolDefinition` from `findTool` dies at the next mutation.** It points
+///   into the list's backing array. This holds single-threaded too: a handler that saves
+///   one and registers a tool has a dangling pointer, with nothing to say so.
+///
+/// The common shape — register everything before serving, then never mutate — needs none
+/// of this, which is why the simple thing has no lock in its way.
 pub const Registry = struct {
     gpa: std.mem.Allocator,
     tools: std.ArrayListUnmanaged(ToolDefinition) = .empty,
@@ -513,6 +544,8 @@ pub const Registry = struct {
         registry.revision += 1;
     }
 
+    /// Deregisters a tool, returning whether one was there. Frees nothing the
+    /// definition pointed at — see the type's note on borrowed strings.
     pub fn removeTool(registry: *Registry, name: []const u8) bool {
         const index = registry.indexOfTool(name) orelse return false;
         _ = registry.tools.orderedRemove(index);
@@ -520,6 +553,11 @@ pub const Registry = struct {
         return true;
     }
 
+    /// The registered tool, or null.
+    ///
+    /// The pointer is into the list's backing array and is invalidated by the next
+    /// mutation of `tools`, so do not hold it across one. Callers here read it and are
+    /// done inside the same dispatch, which is why it is a pointer rather than a copy.
     pub fn findTool(registry: *const Registry, name: []const u8) ?*const ToolDefinition {
         const index = registry.indexOfTool(name) orelse return null;
         return &registry.tools.items[index];
@@ -551,6 +589,7 @@ pub const Registry = struct {
         return true;
     }
 
+    /// The registered prompt, or null. Invalidated by the next mutation, as `findTool`.
     pub fn findPrompt(registry: *const Registry, name: []const u8) ?*const PromptDefinition {
         const index = binarySearch(
             PromptDefinition,
@@ -590,6 +629,8 @@ pub const Registry = struct {
         return true;
     }
 
+    /// The resource registered at exactly this URI, or null. Invalidated by the next
+    /// mutation, as `findTool`.
     pub fn findResource(registry: *const Registry, uri: []const u8) ?*const ResourceDefinition {
         const index = binarySearch(
             ResourceDefinition,
@@ -627,6 +668,8 @@ pub const Registry = struct {
     ///
     /// Templates are RFC 6570 level-1 here: `{var}` matches a single path segment
     /// or the remainder, which covers the shapes MCP servers actually publish.
+    ///
+    /// Invalidated by the next mutation, as `findTool`.
     pub fn matchResourceTemplate(
         registry: *const Registry,
         uri: []const u8,
