@@ -123,10 +123,16 @@ fn bodyWasDropped(ctx: *velo.Context) bool {
 
 /// Registers the MCP endpoint on `path`.
 ///
-/// Only POST is routed. A GET or DELETE reaching the same path therefore falls through
-/// to Velo's own 404 — which is *not* what the spec asks for, so both are registered
-/// explicitly to answer 405 instead. The distinction matters to an older client: 405
-/// says "this endpoint exists but that verb is gone", where 404 says "wrong URL".
+/// POST carries the protocol. Every other method Velo can parse is routed to a 405,
+/// because a route registered for one method only means the rest fall through to Velo's
+/// own 404 — and 404 is a lie about a URL that exists. The distinction is what a client
+/// acts on: 405 with `Allow: POST` says "this endpoint is real, that verb is not", where
+/// 404 sends it looking for a different address.
+///
+/// GET and DELETE are the ones that matter in practice — earlier revisions used them for
+/// a standalone SSE stream and for ending a session — but PUT, PATCH, HEAD, OPTIONS,
+/// TRACE and CONNECT were reaching the 404 for no better reason than that nobody had
+/// listed them.
 ///
 /// A server that mounts this and serves subscriptions must also set
 /// `timeouts.write_ms = 0`, which is what `listen` does for you and what `WriteBound`
@@ -135,8 +141,12 @@ fn bodyWasDropped(ctx: *velo.Context) bool {
 /// seconds — visible to the client as a stream that closes with no reply.
 pub fn mount(app: *App, path: []const u8) !void {
     try app.post(path, handlePost);
-    try app.get(path, handleRemoved);
-    try app.delete(path, handleRemoved);
+    // Derived from the method enum rather than listed, so a method Velo learns to parse
+    // cannot quietly go back to answering 404 here.
+    inline for (comptime std.enums.values(velo.http.Method)) |method| {
+        if (method == .post) continue;
+        try app.route(method, path, handleRemoved, .{});
+    }
 }
 
 /// Publishes the protected resource metadata document, deriving its path from the URL
@@ -173,9 +183,10 @@ fn handleMetadata(ctx: *velo.Context) !void {
     try ctx.text(.ok, bytes);
 }
 
-/// Answers the verbs earlier revisions used.
+/// Answers every method the endpoint does not implement.
 ///
-/// GET opened a standalone SSE stream and DELETE ended a session. Neither exists now.
+/// GET opened a standalone SSE stream and DELETE ended a session in earlier revisions;
+/// neither exists now. The rest were never part of the protocol.
 fn handleRemoved(ctx: *velo.Context) !void {
     ctx.setStatus(.method_not_allowed);
     // Naming what is allowed is what RFC 9110 requires of a 405, and it tells a client
@@ -636,6 +647,37 @@ test "the endpoint state carries the server and its options" {
     );
     try testing.expectEqual(@as(usize, 1), state.endpoint.options.allowed_origins.len);
     try testing.expect(state.endpoint.server == &server);
+}
+
+test "mount answers every method it does not implement, rather than 404" {
+    var registry: server_mod.Registry = .init(testing.allocator);
+    defer registry.deinit();
+    const server: Server = .init(&registry, .{ .name = "s", .version = "1" }, .{});
+
+    var state: State = .init(testing.allocator, &server, .{});
+    var app: App = undefined;
+    app.init(&state);
+    try mount(&app, "/mcp");
+
+    // Driven off the method enum, which is the same source `mount` iterates: adding one
+    // to Velo cannot leave a hole here that this test reads as covered.
+    inline for (comptime std.enums.values(velo.http.Method)) |method| {
+        const found = app.router.find(method, "/mcp") orelse {
+            std.debug.print("no route for {t} on /mcp\n", .{method});
+            return error.MethodFellThroughTo404;
+        };
+        const handler = app.routes[found.handler].handler;
+        if (method == .post) {
+            try testing.expect(handler == handlePost);
+        } else {
+            // PUT, PATCH, HEAD, OPTIONS, TRACE and CONNECT used to reach Velo's 404,
+            // which tells a client the URL is wrong when the verb is.
+            try testing.expect(handler == handleRemoved);
+        }
+    }
+
+    // A different path is still a 404, which is the answer 405 must not displace.
+    try testing.expect(app.router.find(.post, "/other") == null);
 }
 
 test "the write bound is lifted for a server that serves subscriptions" {
