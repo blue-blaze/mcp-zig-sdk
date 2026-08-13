@@ -332,8 +332,6 @@ pub const Transport = struct {
     /// pointers into it. Storing it by value would invalidate every one of them the
     /// moment the exchange were assigned into this field.
     exchange: ?*Exchange = null,
-    /// Set when the request was accepted with no body to read.
-    accepted: bool = false,
     /// The `Mcp-Session-Id` a pre-2026-07-28 server assigned, owned by this transport.
     ///
     /// Null against a 2026-07-28 server, which has no sessions — the revision removed them
@@ -523,19 +521,28 @@ pub const Transport = struct {
             return error.Unauthorized;
         }
 
-        self.accepted = exchange.status() == 202;
+        // A 202 is the whole answer: the notification was accepted and there is no body.
+        // Closed here rather than left for the next `send` to close, because nothing will
+        // ever call `receive` for it — `Client.notify` sends and returns — so the exchange
+        // would otherwise sit open across calls, and under TLS its teardown would then
+        // happen at an arbitrary later moment against a peer that finished with the
+        // connection long before. That is the sequence the segfault was reported as, and
+        // `notifications/initialized` in the legacy handshake is exactly this path, which
+        // is why negotiating made it more likely rather than less.
+        if (exchange.status() == 202) {
+            // Not via `finish`: the `errdefer` above covers the error paths, and this is
+            // not one — the request succeeded and there is simply nothing left to hold.
+            exchange.close(self.io);
+            return;
+        }
         self.exchange = exchange;
     }
 
     /// Yields the next message the server sent, or null when the response is spent.
     pub fn receive(self: *Transport, arena: std.mem.Allocator) Error!?[]const u8 {
+        // Null covers both "never sent" and "the last send was a 202", which `send`
+        // closes on the spot. A notification has nothing to yield either way.
         const exchange = self.exchange orelse return null;
-        if (self.accepted) {
-            // 202 with no body: a notification was accepted. There is nothing to read
-            // and nothing to wait for.
-            self.finish();
-            return null;
-        }
 
         const message = exchange.next(arena, self.options.response_bytes_max) catch |err| {
             self.finish();
@@ -557,7 +564,6 @@ pub const Transport = struct {
     fn finish(self: *Transport) void {
         if (self.exchange) |exchange| exchange.close(self.io);
         self.exchange = null;
-        self.accepted = false;
     }
 
     fn report(self: *const Transport, comptime fmt: []const u8, args: anytype) void {
@@ -1386,7 +1392,31 @@ const TlsSession = if (velo.tls_enabled) struct {
         return result;
     }
 
+    /// Tells OpenSSL not to negotiate the shutdown, before velo tears the session down.
+    ///
+    /// `velo.tls.Session.deinit` calls `SSL_shutdown`, which sends `close_notify` and then
+    /// *reads* for the peer's. Against a server that has already finished with the
+    /// connection there is nothing to read it from, and OpenSSL faults inside
+    /// `ssl3_read_bytes` beneath `ssl3_shutdown` rather than returning an error. Reported
+    /// from use as roughly one crash in six runs against a live gateway — and on a worker
+    /// thread, so the process could still exit 0 with a truncated stdout and empty stderr,
+    /// which is how it stayed hidden for two rounds of reports.
+    ///
+    /// `SSL_set_quiet_shutdown` makes `SSL_shutdown` set its flags and return at once,
+    /// sending nothing and reading nothing. Declared here rather than reached through velo
+    /// because velo keeps its `@cImport` private; the symbol is part of OpenSSL's stable
+    /// ABI, and this branch is only compiled when velo linked libssl in the first place.
+    ///
+    /// What it gives up is `close_notify`, whose job is to let a receiver tell a clean end
+    /// of data from a truncated one. Nothing here rests on it: a length-delimited body is
+    /// complete when its length is met and SSE events are self-delimiting, so a truncated
+    /// response is already detectable from the framing. And the connection is never reused
+    /// — the request says `Connection: close`, and one exchange owns one connection — so
+    /// there is no session for a peer to be confused about afterwards.
+    extern fn SSL_set_quiet_shutdown(ssl: *anyopaque, mode: c_int) void;
+
     fn deinit(self: *TlsSession, gpa: std.mem.Allocator) void {
+        SSL_set_quiet_shutdown(@ptrCast(self.session.ssl), 1);
         self.session.deinit();
         self.context.deinit();
         gpa.free(self.read_buffer);
@@ -2328,6 +2358,8 @@ const SlowServer = struct {
     /// How many SSE events to send. Zero means the request is accepted and never
     /// answered.
     events: usize,
+    /// Answer `202 Accepted` with no body, the way a server answers a notification.
+    accept_only: bool = false,
 
     ready: std.atomic.Value(bool) = .init(false),
     failed: std.atomic.Value(bool) = .init(false),
@@ -2372,7 +2404,11 @@ fn slowServerThread(state: *SlowServer) void {
     var response = connection.writer(io, &write_buffer);
     const out = &response.interface;
 
-    if (state.events > 0) {
+    if (state.accept_only) {
+        out.writeAll("HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n") catch
+            return state.fail();
+        out.flush() catch return state.fail();
+    } else if (state.events > 0) {
         out.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n" ++
             "Transfer-Encoding: chunked\r\n\r\n") catch return state.fail();
         out.flush() catch return state.fail();
@@ -2405,6 +2441,7 @@ fn slowServerThread(state: *SlowServer) void {
 /// that a collision is a failure rather than a silent pass against something else.
 const silent_test_port: u16 = 18493;
 const chatty_test_port: u16 = 18494;
+const accepted_test_port: u16 = 18495;
 
 /// Why these two tests do not run on Windows.
 ///
@@ -2463,6 +2500,44 @@ test "a server that takes the request and says nothing hits the deadline" {
     // Returning instantly would mean something else failed and got named `Timeout`.
     // Half the deadline, because a coarse clock may round the wait down.
     try testing.expect(started.untilNow(io, .awake).toMilliseconds() >= 75);
+}
+
+test "an accepted notification leaves no exchange open behind it" {
+    if (!socket_tests_supported) return error.SkipZigTest;
+    // The first half of the TLS teardown crash, and the half that can be asserted without
+    // TLS: a 202 has no body and nothing will ever call `receive` for it, so an exchange
+    // kept here would sit open until some later `send` closed it — under TLS, against a
+    // peer that had finished with the connection long before.
+    const state = try testing.allocator.create(SlowServer);
+    defer testing.allocator.destroy(state);
+    state.* = .{ .port = accepted_test_port, .gap_ms = 0, .events = 0, .accept_only = true };
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var thread = try std.Thread.spawn(.{}, slowServerThread, .{state});
+    defer {
+        state.stop.store(true, .release);
+        thread.join();
+    }
+    while (!state.ready.load(.acquire)) std.Thread.yield() catch {};
+    if (state.failed.load(.acquire)) return error.SkipZigTest;
+
+    const url = std.fmt.comptimePrint("http://127.0.0.1:{d}/mcp", .{accepted_test_port});
+    var transport: Transport = .init(testing.allocator, io, url, .{});
+    defer transport.deinit();
+
+    try transport.send(
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{}}",
+    );
+    // Closed on the spot rather than carried into the next call.
+    try testing.expect(transport.exchange == null);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    // And a caller that does call `receive` still gets the same answer as before: nothing.
+    try testing.expectEqual(@as(?[]const u8, null), try transport.receive(arena.allocator()));
 }
 
 test "a server that keeps talking keeps its connection past the deadline" {
@@ -2649,4 +2724,20 @@ test "https: an MCP call round-trips over TLS" {
     const result = try mcp_client.callTool(arena, "echo", .{ .object = args }, .{});
     try std.testing.expect(!(result.isError orelse false));
     try std.testing.expectEqualStrings("over tls: hello", result.content[0].text.text);
+
+    // The sequence the TLS teardown crash was reported as, end to end over a real session:
+    // a notification is answered `202` with no body, nothing calls `receive` for it, and a
+    // later request is what tears the session down. `SSL_shutdown` sends `close_notify` and
+    // then reads for the peer's, and against a peer already finished with the connection
+    // OpenSSL faulted inside `ssl3_read_bytes` instead of returning an error — about one run
+    // in six, on a worker thread, so the process could still exit 0.
+    //
+    // Deterministic here only in that it exercises the path; the crash was intermittent by
+    // nature. `an accepted notification leaves no exchange open behind it` is the assertion
+    // that holds on every run, and it runs without `-Dtls`.
+    try mcp_client.cancel(arena, .{ .number = 99 }, "never started");
+    try std.testing.expect(transport.exchange == null);
+
+    const after = try mcp_client.listTools(arena, .{});
+    try std.testing.expectEqual(@as(usize, 1), after.tools.len);
 }
