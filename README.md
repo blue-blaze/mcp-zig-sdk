@@ -19,6 +19,63 @@ exe.root_module.addImport("mcp", mcp_dep.module("mcp"));
 exe.root_module.addImport("oauth", mcp_dep.module("oauth"));
 ```
 
+## A whole server
+
+`examples/hello.zig` in full — a tool, a registry, a server, stdio. There is no
+`initialize`/`initialized` handshake to write: 2026-07-28 is stateless, so the first
+request may be the real one.
+
+```zig
+const std = @import("std");
+const mcp = @import("mcp");
+
+const GreetArgs = struct {
+    who: []const u8,
+    greeting: ?[]const u8 = null,
+
+    pub const schema_docs = .{ .who = "Who to greet" };
+};
+
+fn greet(context: *mcp.Context, args: GreetArgs) mcp.Error!mcp.types.CallToolResult {
+    return context.textResult(try context.print("{s}, {s}!", .{
+        args.greeting orelse "Hello",
+        args.who,
+    }));
+}
+
+pub fn main() !void {
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = debug_allocator.deinit();
+    const gpa = debug_allocator.allocator();
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    var registry = try mcp.Registry.initComptime(gpa, .{
+        mcp.tool("greet", greet, .{ .description = "Greets somebody by name." }),
+    });
+    defer registry.deinit();
+
+    const server: mcp.Server = .init(&registry, .{ .name = "hello", .version = "0.1.0" }, .{});
+    try mcp.stdio.serve(gpa, threaded.io(), &server);
+}
+```
+
+`GreetArgs` is the tool's contract: its JSON Schema is generated from the type at compile
+time, and `context.print` allocates from an arena freed once the reply is written, so
+there is nothing to release. Talk to it with one line:
+
+```sh
+zig build examples
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+  "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+           "io.modelcontextprotocol/clientCapabilities":{}},
+  "name":"greet","arguments":{"who":"Ada"}}}' | ./zig-out/bin/hello
+```
+
+Serving the same registry over HTTP instead is `mcp.velo_http.listen` in place of
+`mcp.stdio.serve`; `examples/http_server.zig` is the equivalent file.
+
 ## Modules
 
 | Module  | Purpose |

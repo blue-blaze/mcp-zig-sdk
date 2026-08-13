@@ -192,6 +192,7 @@ const Example = struct {
 /// of the SDK; `zig build run-<name>` starts it.
 const examples = [_]Example{
     .{ .name = "smoke", .path = "examples/smoke.zig" },
+    .{ .name = "hello", .path = "examples/hello.zig" },
     .{ .name = "stdio-server", .path = "examples/stdio_server.zig" },
     .{ .name = "stdio-client", .path = "examples/stdio_client.zig" },
     .{ .name = "http-server", .path = "examples/http_server.zig" },
