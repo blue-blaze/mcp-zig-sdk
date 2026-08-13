@@ -2339,14 +2339,6 @@ const SlowServer = struct {
         state.failed.store(true, .release);
         state.ready.store(true, .release);
     }
-
-    /// `fail`, for the paths that have to report "this connection is finished with" at the
-    /// same time. Serving stops either way; the flag is what turns it into a skip rather
-    /// than a wrong answer.
-    fn fail2(state: *SlowServer) bool {
-        state.fail();
-        return true;
-    }
 };
 
 fn slowServerThread(state: *SlowServer) void {
@@ -2363,36 +2355,7 @@ fn slowServerThread(state: *SlowServer) void {
     defer listener.deinit(io);
     state.ready.store(true, .release);
 
-    // Accept until one connection actually delivers a request, rather than accepting
-    // exactly once.
-    //
-    // "I have called listen" is necessary and not sufficient on Windows. `std.Io.Threaded`
-    // drives a listener through AFD directly, and its `START_LISTEN` does not queue a
-    // backlog the way `listen(2)` does on a POSIX system — so a client that connects
-    // before an `accept` is outstanding may be refused outright or accepted and torn down
-    // immediately. Both happened in CI, as `CONNECTION_REFUSED` on the client's connect
-    // and `LOCAL_DISCONNECT` on its first write: two NTSTATUS codes, one cause.
-    //
-    // Treating either as fatal made this harness the flaky part of a test about deadlines.
-    // A connection that dies before its request arrives is that race and not the subject,
-    // so it is dropped and the next one is taken.
-    var refusals: usize = 0;
-    while (!state.stop.load(.acquire)) {
-        const connection = listener.accept(io) catch {
-            // Bounded, so a listener that can never accept fails the test rather than
-            // spinning until the job times out.
-            refusals += 1;
-            if (refusals == 64) return state.fail();
-            continue;
-        };
-        if (serveSlowly(state, io, connection)) return;
-    }
-}
-
-/// Serves one connection, and reports whether it was the real one.
-///
-/// False means it died before delivering a request, so the caller should wait for another.
-fn serveSlowly(state: *SlowServer, io: std.Io, connection: std.Io.net.Stream) bool {
+    const connection = listener.accept(io) catch return state.fail();
     defer connection.close(io);
 
     // Read the request head to its blank line. Without this the test would prove only
@@ -2401,7 +2364,7 @@ fn serveSlowly(state: *SlowServer, io: std.Io, connection: std.Io.net.Stream) bo
     var read_buffer: [4096]u8 = undefined;
     var request = connection.reader(io, &read_buffer);
     while (true) {
-        const line = request.interface.takeDelimiterExclusive('\n') catch return false;
+        const line = request.interface.takeDelimiterExclusive('\n') catch return state.fail();
         if (std.mem.trimEnd(u8, line, "\r").len == 0) break;
     }
 
@@ -2409,12 +2372,10 @@ fn serveSlowly(state: *SlowServer, io: std.Io, connection: std.Io.net.Stream) bo
     var response = connection.writer(io, &write_buffer);
     const out = &response.interface;
 
-    // Past this point the connection carried a request, so it is the one under test and
-    // any failure on it belongs to the test rather than to the accept race.
     if (state.events > 0) {
         out.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n" ++
-            "Transfer-Encoding: chunked\r\n\r\n") catch return state.fail2();
-        out.flush() catch return state.fail2();
+            "Transfer-Encoding: chunked\r\n\r\n") catch return state.fail();
+        out.flush() catch return state.fail();
 
         var sent: usize = 0;
         while (sent < state.events) : (sent += 1) {
@@ -2422,23 +2383,22 @@ fn serveSlowly(state: *SlowServer, io: std.Io, connection: std.Io.net.Stream) bo
                 .raw = .fromMilliseconds(state.gap_ms),
                 .clock = .awake,
             };
-            gap.sleep(io) catch return true;
+            gap.sleep(io) catch return;
 
             const event = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\r\n\r\n";
-            out.print("{x}\r\n{s}\r\n", .{ event.len, event }) catch return state.fail2();
-            out.flush() catch return state.fail2();
+            out.print("{x}\r\n{s}\r\n", .{ event.len, event }) catch return state.fail();
+            out.flush() catch return state.fail();
         }
-        out.writeAll("0\r\n\r\n") catch return state.fail2();
-        out.flush() catch return state.fail2();
+        out.writeAll("0\r\n\r\n") catch return state.fail();
+        out.flush() catch return state.fail();
     }
 
     // Hold the connection open. Closing it would produce end-of-stream, which is the one
     // outcome that must not be confused with the deadline.
     while (!state.stop.load(.acquire)) {
         const tick: std.Io.Clock.Duration = .{ .raw = .fromMilliseconds(10), .clock = .awake };
-        tick.sleep(io) catch return true;
+        tick.sleep(io) catch return;
     }
-    return true;
 }
 
 /// Fixed ports, because `std.Io.net.Server` cannot be asked what it bound. Unusual enough
@@ -2446,54 +2406,45 @@ fn serveSlowly(state: *SlowServer, io: std.Io, connection: std.Io.net.Stream) bo
 const silent_test_port: u16 = 18493;
 const chatty_test_port: u16 = 18494;
 
-/// Posts `message`, waiting out a listener that is not accepting yet.
+/// Why these two tests do not run on Windows.
 ///
-/// The client half of the same Windows race: the server thread's readiness flag says
-/// `listen` returned, which is not yet "connectable". Retried rather than slept past,
-/// because a sleep long enough for a loaded runner is one every local run pays, and one
-/// short enough not to notice is one the runner fails on.
+/// They are the only tests in this repository that open a real socket, and they need a
+/// listener a client can connect to. `std.Io.Threaded` drives a Windows listener through
+/// AFD directly: `accept` is an `AFD_WAIT_FOR_LISTEN` IOCTL that must be outstanding for
+/// an incoming connection to complete, with no kernel-managed backlog behind it the way
+/// `listen(2)` provides. In CI the client's connect is answered with `CONNECTION_REFUSED`
+/// and, on the second test, its first write with `LOCAL_DISCONNECT`.
 ///
-/// `ConnectionFailed` is the only error retried, and it is what both symptoms arrive as: a
-/// refused connect and a first write onto a torn-down connection are both mapped to it by
-/// `Exchange.open` and `writeRequest`. Anything else — `Timeout` above all — is the answer
-/// the test came for.
-fn sendWhenListening(transport: *Transport, message: []const u8) Error!void {
-    var attempts: usize = 0;
-    while (true) : (attempts += 1) {
-        if (transport.send(message)) |_| {
-            return;
-        } else |err| {
-            if (err != error.ConnectionFailed or attempts == 100) return err;
-            const pause: std.Io.Clock.Duration = .{
-                .raw = .fromMilliseconds(10),
-                .clock = .awake,
-            };
-            pause.sleep(transport.io) catch {};
-        }
-    }
-}
+/// It is not a startup race, which was the first guess: making the server accept in a loop
+/// and the client retry a refused send for a second changed neither symptom. It is also
+/// not the behaviour under test — the deadline is never reached, because the exchange never
+/// gets as far as a read.
+///
+/// So the harness cannot be built on this platform, and the two tests are skipped rather
+/// than weakened into passing everywhere. `receive_timeout_ms` is measured on Linux and
+/// macOS, where the same code path runs; `TimedReader` is still compiled and analyzed here,
+/// because `Exchange.open` names it on a runtime branch rather than a comptime one. What is
+/// *not* covered on Windows is whether `Io.operateTimeout` over `net_receive` behaves there
+/// — see the Platforms section of the README.
+const socket_tests_supported = @import("builtin").os.tag != .windows;
 
 test "a server that takes the request and says nothing hits the deadline" {
+    if (!socket_tests_supported) return error.SkipZigTest;
     const state = try testing.allocator.create(SlowServer);
     defer testing.allocator.destroy(state);
     state.* = .{ .port = silent_test_port, .gap_ms = 0, .events = 0 };
 
-    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
     var thread = try std.Thread.spawn(.{}, slowServerThread, .{state});
     defer {
         state.stop.store(true, .release);
-        // The flag alone is not enough: the accept loop parks inside `accept` and cannot
-        // see it until something returns from there. One throwaway connection is the
-        // simplest wake-up, and without it a run that never reached the server would hang
-        // in `join` instead of failing.
-        wakeAccept(io, silent_test_port);
         thread.join();
     }
     while (!state.ready.load(.acquire)) std.Thread.yield() catch {};
     if (state.failed.load(.acquire)) return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
 
     const url = std.fmt.comptimePrint("http://127.0.0.1:{d}/mcp", .{silent_test_port});
     var transport: Transport = .init(testing.allocator, io, url, .{
@@ -2507,7 +2458,7 @@ test "a server that takes the request and says nothing hits the deadline" {
     // returns, which is the whole of the reported bug.
     try testing.expectError(
         error.Timeout,
-        sendWhenListening(&transport, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}"),
+        transport.send("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}"),
     );
     // Returning instantly would mean something else failed and got named `Timeout`.
     // Half the deadline, because a coarse clock may round the wait down.
@@ -2515,6 +2466,7 @@ test "a server that takes the request and says nothing hits the deadline" {
 }
 
 test "a server that keeps talking keeps its connection past the deadline" {
+    if (!socket_tests_supported) return error.SkipZigTest;
     // The property a subscription depends on: the deadline is a gap between bytes, not a
     // bound on the exchange. Three 100 ms gaps against a 400 ms deadline — each gap well
     // inside it, the total well past it — so an implementation that armed one deadline
@@ -2523,17 +2475,16 @@ test "a server that keeps talking keeps its connection past the deadline" {
     defer testing.allocator.destroy(state);
     state.* = .{ .port = chatty_test_port, .gap_ms = 100, .events = 3 };
 
-    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
-    defer threaded.deinit();
-
     var thread = try std.Thread.spawn(.{}, slowServerThread, .{state});
     defer {
         state.stop.store(true, .release);
-        wakeAccept(threaded.io(), chatty_test_port);
         thread.join();
     }
     while (!state.ready.load(.acquire)) std.Thread.yield() catch {};
     if (state.failed.load(.acquire)) return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -2544,7 +2495,7 @@ test "a server that keeps talking keeps its connection past the deadline" {
     });
     defer transport.deinit();
 
-    try sendWhenListening(&transport, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}");
+    try transport.send("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}");
 
     var received: usize = 0;
     while (try transport.receive(arena.allocator())) |_| received += 1;

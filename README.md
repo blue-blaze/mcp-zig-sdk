@@ -492,6 +492,22 @@ only shows up on the platform itself:
   `core.autocrlf=true` and there was no `.gitattributes`. That one reads like a formatting
   problem in the code and is not one; see the comment in `.gitattributes`.
 
+One gap is left rather than papered over. The two tests that measure
+`receive_timeout_ms` need a listener a client can connect to, and they are the only tests
+here that open a real socket. `std.Io.Threaded` drives a Windows listener through AFD
+directly, where `accept` is an `AFD_WAIT_FOR_LISTEN` IOCTL that has to be outstanding for
+an incoming connection to complete — there is no kernel-managed backlog behind it the way
+`listen(2)` provides. The client's connect is answered with `CONNECTION_REFUSED`, and its
+first write with `LOCAL_DISCONNECT`. It is not a startup race: making the server accept in
+a loop and the client retry for a second changed neither symptom.
+
+So those two skip on Windows. The deadline itself is measured on Linux and macOS, running
+the same code, and `TimedReader` is still compiled and analyzed on Windows because
+`Exchange.open` names it on a runtime branch — so it cannot rot there the way the `-Dtls`
+branch did. What is genuinely unverified on Windows is whether `Io.operateTimeout` over
+`net_receive` works at all, and a server that goes quiet on that platform may therefore
+still hang. Said plainly here because a skipped test is easy to mistake for a covered one.
+
 ## Testing
 
 ```sh
