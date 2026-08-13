@@ -134,10 +134,23 @@ pub const Metadata = struct {
             metadata.introspection_endpoint,
             metadata.jwks_uri,
         };
+        // Plain http is tolerated only when the *issuer itself* is loopback — a local
+        // development authorization server, where there is no network to protect.
+        //
+        // Deciding it per endpoint let a genuine `https://auth.example.com` document
+        // name `http://127.0.0.1:9/token`, and the client would then post its
+        // authorization code to whatever happened to be listening on the machine it runs
+        // on. That code is exchangeable for a token, so the exemption meant for a
+        // developer's own server was a way for a remote one to redirect credentials
+        // inward.
+        const issuer_parts = url.parse(metadata.issuer) catch return error.InvalidIssuer;
+        const local_issuer = issuer_parts.isLoopback();
         for (endpoints) |endpoint| {
             const value = endpoint orelse continue;
             const parts = url.parse(value) catch return error.InvalidEndpoint;
-            if (!parts.isHttps() and !parts.isLoopback()) return error.InsecureEndpoint;
+            if (parts.isHttps()) continue;
+            if (local_issuer and parts.isLoopback()) continue;
+            return error.InsecureEndpoint;
         }
 
         const lists = [_]?[]const []const u8{
@@ -469,6 +482,46 @@ test "parse allows loopback endpoints for local development" {
         "http://localhost:9000",
     );
     try metadata.requirePkce();
+}
+
+test "the loopback exemption belongs to the issuer, not to each endpoint" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    // A real authorization server pointing an endpoint at the client's own machine.
+    // Nothing about the document is otherwise wrong — the issuer matches, and it is
+    // https — so the endpoint check is the only thing standing between the client and
+    // posting its authorization code to a local listener.
+    for ([_][]const u8{
+        "http://127.0.0.1:9/token",
+        "http://localhost:9/authorize",
+        "http://[::1]:9/jwks",
+    }) |endpoint| {
+        const field = if (std.mem.endsWith(u8, endpoint, "/token"))
+            "token_endpoint"
+        else if (std.mem.endsWith(u8, endpoint, "/authorize"))
+            "authorization_endpoint"
+        else
+            "jwks_uri";
+        const document = try std.fmt.allocPrint(
+            arena.allocator(),
+            "{{\"issuer\":\"https://auth.example.com\",\"{s}\":\"{s}\"}}",
+            .{ field, endpoint },
+        );
+        try std.testing.expectError(error.InsecureEndpoint, parse(
+            arena.allocator(),
+            document,
+            "https://auth.example.com",
+        ));
+    }
+
+    // And a loopback issuer may still not send the client off the machine in the clear.
+    try std.testing.expectError(error.InsecureEndpoint, parse(
+        arena.allocator(),
+        "{\"issuer\":\"http://localhost:9000\"," ++
+            "\"token_endpoint\":\"http://auth.example.com/token\"}",
+        "http://localhost:9000",
+    ));
 }
 
 test "parse rejects malformed documents" {
