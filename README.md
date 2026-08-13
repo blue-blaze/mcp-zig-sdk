@@ -191,6 +191,15 @@ The default stays `.reject`, and that is the point of having the knob at all: a 
 nobody asked for is a downgrade nobody notices. Every other leg of the interoperability
 matrix runs against a peer configured to refuse the older protocol for the same reason.
 
+**Most applications should pass `.negotiate` anyway**, and the reason is deployment rather
+than principle: the managed MCP servers in service today are still on the 2025 revisions, so
+a client that refuses them fails against the common case. An agent connecting to servers it
+does not control wants `.negotiate` and wants `negotiatedVersion()` surfaced where a user
+can see it. Something talking only to servers shipped alongside it should keep `.reject`, so
+a peer left on an old revision is a loud failure rather than a quiet downgrade. Either way,
+set `Options.diagnostics`: with `.reject` the refusal names the version and not the cause,
+and one line of diagnostics is the difference between a minute and an afternoon.
+
 What crosses the boundary, checked end to end by `interop/run.sh` leg 5 against the
 official TypeScript SDK serving 2025: `tools/list`, `tools/call`, `prompts/list`,
 `prompts/get`, `resources/list`, `resources/templates/list`, `resources/read`,

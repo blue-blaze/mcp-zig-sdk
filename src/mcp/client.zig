@@ -63,6 +63,18 @@ const assert = assert_mod.assert;
 /// first message and threading it through every call would say otherwise. Both
 /// transports in this SDK do exactly this.
 ///
+/// ## Calls are serialized, and that is a guarantee
+///
+/// The question a captured `Io` raises next is which thread will use it. `Client` makes
+/// one call at a time: `send`, then `receive` until the exchange is over, then the next
+/// `send`. It holds mutable state — the id counter, the negotiated era — behind no lock,
+/// so a `Client` must not be driven from two threads at once, and in exchange a
+/// `Transport` needs no lock of its own. That is what lets both transports here keep a
+/// single in-flight exchange in a plain field.
+///
+/// Concurrency, when it is wanted, is one `Client` and one `Transport` per connection
+/// rather than one shared pair. Nothing in either type is per-process.
+///
 /// ## Abandoning a call is safe
 ///
 /// A caller that stops waiting — a deadline, a cancelled task — does not corrupt the
@@ -328,6 +340,23 @@ pub const Call = struct {
 };
 
 /// Whether this client will speak to a server from before 2026-07-28.
+///
+/// ## Which one to pick
+///
+/// The default is `.reject`, and it is the right default for a protocol library: falling
+/// back is a downgrade, and one that happens without being asked for is one nobody
+/// notices. But it is not the right choice for most applications today, and the reason is
+/// deployment rather than principle — the managed MCP servers in service are still on the
+/// 2025 revisions, so a client that refuses them fails against the common case.
+///
+/// So: an agent or a tool that connects to servers it does not control almost certainly
+/// wants `.negotiate`, and wants to report `negotiatedVersion()` somewhere a user can see
+/// it. Something that talks only to servers shipped alongside it should keep `.reject`, so
+/// that a peer accidentally left on an old revision is a loud failure rather than a quiet
+/// downgrade.
+///
+/// Worth knowing before choosing: with `.reject`, a 2025 server's refusal names the
+/// version and not the cause. `Options.diagnostics` is what turns it into a sentence.
 pub const LegacyMode = enum {
     /// Speak 2026-07-28 and nothing else. A server on an older revision fails, with the
     /// error it produced.
