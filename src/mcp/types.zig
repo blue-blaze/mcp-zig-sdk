@@ -615,8 +615,20 @@ pub const ContentBlock = union(enum) {
         }
         if (std.mem.eql(u8, tag, "resource")) {
             const resource = object.get("resource") orelse return error.InvalidContent;
+            // The nested `resource` is a union, so this block cannot go through
+            // `parseWire` the way its four siblings do — and building it by hand is how
+            // the wrapper's own `annotations` and `_meta` came to be dropped. They belong
+            // to the block, not to the contents inside it: `priority` and `audience` say
+            // how a client should treat this attachment, and `_meta` is the only channel
+            // an extension has. Silently discarding either makes a server's instruction
+            // vanish with nothing to show it was ever sent.
             return .{ .resource = .{
                 .resource = try resourceContentsFromValue(gpa, resource),
+                .annotations = if (object.get("annotations")) |declared|
+                    try parseWire(Annotations, gpa, declared)
+                else
+                    null,
+                ._meta = object.get("_meta"),
             } };
         }
         return error.UnknownContentType;
@@ -2192,6 +2204,44 @@ test "content blocks decode from the wire" {
         const value = try std.json.parseFromSliceLeaky(std.json.Value, gpa, bytes, .{});
         const block = try ContentBlock.fromValue(gpa, value);
         try testing.expectEqual(tag, std.meta.activeTag(block));
+    }
+}
+
+test "every content block keeps the annotations and _meta it arrived with" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    // Driven over all five shapes rather than just the one that was broken: the
+    // embedded-resource block is hand-built because its contents are a union, and that
+    // is exactly why it was the one that silently dropped both fields.
+    const cases = [_][]const u8{
+        \\{"type":"text","text":"hi",
+        ,
+        \\{"type":"image","data":"AA","mimeType":"image/png",
+        ,
+        \\{"type":"audio","data":"AA","mimeType":"audio/wav",
+        ,
+        \\{"type":"resource_link","uri":"u","name":"n",
+        ,
+        \\{"type":"resource","resource":{"uri":"u","text":"t"},
+        ,
+    };
+    const tail =
+        \\"annotations":{"priority":0.5,"audience":["user"]},"_meta":{"vendor/tag":"x"}}
+    ;
+
+    for (cases) |head| {
+        const bytes = try std.mem.concat(gpa, u8, &.{ head, tail });
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, gpa, bytes, .{});
+        const block = try ContentBlock.fromValue(gpa, value);
+        const annotations, const meta = switch (block) {
+            inline else => |inner| .{ inner.annotations, inner._meta },
+        };
+        try testing.expectEqual(@as(f64, 0.5), annotations.?.priority.?);
+        try testing.expectEqual(@as(usize, 1), annotations.?.audience.?.len);
+        try testing.expectEqual(Role.user, annotations.?.audience.?[0]);
+        try testing.expectEqualStrings("x", meta.?.object.get("vendor/tag").?.string);
     }
 }
 
