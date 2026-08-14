@@ -15,8 +15,8 @@
         // Update both fields together:
         //   zig fetch --save=velo git+https://github.com/blue-blaze/velo.git#<tag>
         .velo = .{
-            .url = "git+https://github.com/blue-blaze/velo.git#v0.1.1",
-            .hash = "velo-0.1.1-LF_4KkfiFQDY6HFzbJ4bl8pubtIWKpSzm_0HhFDjbe4N",
+            .url = "git+https://github.com/blue-blaze/velo.git#v0.1.3",
+            .hash = "velo-0.1.3-LF_4KueAFgABAaja17FVci_6N1msfZA9Fbp3Wg5ZjOwH",
         },
     },
     .paths = .{

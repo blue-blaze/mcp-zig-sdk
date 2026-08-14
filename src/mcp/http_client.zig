@@ -1392,31 +1392,18 @@ const TlsSession = if (velo.tls_enabled) struct {
         return result;
     }
 
-    /// Tells OpenSSL not to negotiate the shutdown, before velo tears the session down.
-    ///
-    /// `velo.tls.Session.deinit` calls `SSL_shutdown`, which sends `close_notify` and then
-    /// *reads* for the peer's. Against a server that has already finished with the
-    /// connection there is nothing to read it from, and OpenSSL faults inside
-    /// `ssl3_read_bytes` beneath `ssl3_shutdown` rather than returning an error. Reported
-    /// from use as roughly one crash in six runs against a live gateway — and on a worker
-    /// thread, so the process could still exit 0 with a truncated stdout and empty stderr,
-    /// which is how it stayed hidden for two rounds of reports.
-    ///
-    /// `SSL_set_quiet_shutdown` makes `SSL_shutdown` set its flags and return at once,
-    /// sending nothing and reading nothing. Declared here rather than reached through velo
-    /// because velo keeps its `@cImport` private; the symbol is part of OpenSSL's stable
-    /// ABI, and this branch is only compiled when velo linked libssl in the first place.
-    ///
-    /// What it gives up is `close_notify`, whose job is to let a receiver tell a clean end
-    /// of data from a truncated one. Nothing here rests on it: a length-delimited body is
-    /// complete when its length is met and SSE events are self-delimiting, so a truncated
-    /// response is already detectable from the framing. And the connection is never reused
-    /// — the request says `Connection: close`, and one exchange owns one connection — so
-    /// there is no session for a peer to be confused about afterwards.
-    extern fn SSL_set_quiet_shutdown(ssl: *anyopaque, mode: c_int) void;
-
     fn deinit(self: *TlsSession, gpa: std.mem.Allocator) void {
-        SSL_set_quiet_shutdown(@ptrCast(self.session.ssl), 1);
+        // No shutdown negotiation, deliberately — and since velo 0.1.3, no workaround
+        // either. `Session.deinit` used to call `SSL_shutdown`, which reads the socket
+        // for the peer's `close_notify` and faulted inside `ssl3_read_bytes` when the
+        // peer was already gone (about one teardown in six against a live gateway);
+        // this transport carried an `SSL_set_quiet_shutdown` extern to keep that path
+        // unreachable. velo's `deinit` is now `SSL_free` alone and the `close_notify`
+        // exchange is an explicit `Session.shutdown()`, which this transport does not
+        // call: a length-delimited body is complete when its length is met, SSE events
+        // are self-delimiting, and one exchange owns one connection — so a truncated
+        // stream is already detectable from the framing and there is no reused session
+        // for a peer to be confused about.
         self.session.deinit();
         self.context.deinit();
         gpa.free(self.read_buffer);

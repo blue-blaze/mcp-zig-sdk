@@ -131,14 +131,16 @@ still type-checks the path it cannot run. The round trip was negative-verified b
 making the client *verify* the self-signed certificate: it then fails, which is what
 proves a TLS handshake is happening rather than a plaintext connection succeeding.
 
-A TLS session is torn down with `SSL_set_quiet_shutdown`, so `SSL_shutdown` neither sends
-`close_notify` nor reads for the peer's. Reading for it is what crashed: against a server
-that had finished with the connection there was nothing to read from, and OpenSSL faulted
-inside `ssl3_read_bytes` rather than returning an error — about one run in six against a
-live gateway, reported from use. Skipping `close_notify` gives up the ability to tell a
-clean end of data from a truncated one, and nothing here rests on that: a length-delimited
-body is complete when its length is met, SSE events are self-delimiting, and the connection
-is never reused.
+A TLS session is torn down without negotiating the shutdown: `Session.deinit` releases the
+session and never touches the socket, and this transport does not call the explicit
+`Session.shutdown()` velo offers. It used to take a workaround to get this behaviour —
+velo's `deinit` once called `SSL_shutdown`, which *reads* the socket for the peer's
+`close_notify` and faulted inside `ssl3_read_bytes` when the peer was already gone, about
+one run in six against a live gateway; this transport kept that path unreachable with an
+`SSL_set_quiet_shutdown` extern until velo 0.1.3 removed the I/O from `deinit` itself.
+Skipping `close_notify` gives up the ability to tell a clean end of data from a truncated
+one, and nothing here rests on that: a length-delimited body is complete when its length
+is met, SSE events are self-delimiting, and the connection is never reused.
 
 ## Tool arguments
 
