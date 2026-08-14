@@ -1,7 +1,7 @@
 .{
     // A Zig SDK for the Model Context Protocol, revision 2026-07-28 ("MCP 2.0").
     .name = .mcp,
-    .version = "0.2.1",
+    .version = "0.2.2",
     .fingerprint = 0xa19bc839996a86d4,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
